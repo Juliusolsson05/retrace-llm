@@ -119,3 +119,9 @@ scripts/release.sh
 # Release artifacts
 releases/
 local/
+
+# Local git worktrees
+.worktrees/
+
+# Staged decomposition docs (tracked: implementation plans are committed per convention)
+!docs/decomposition/*.md
