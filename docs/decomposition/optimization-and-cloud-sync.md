@@ -32,15 +32,16 @@ Tracks are independent after Stage 0. Recommended execution: B1 first (data prot
 
 | Artifact | Trusted for | Known limitations |
 |---|---|---|
-| `Capture/CaptureManager.swift` + `Capture/Deduplication/FrameDeduplicator.swift` | Adaptive capture + dedup behavior | Similarity appears computed twice on the diagnostic/`shouldKeepFrame` path — candidate, unmeasured |
-| `Processing/FrameProcessingQueue.swift`, `Processing/OCR/VisionOCR.swift`, `FullFrameOCRCache.swift` | Durable OCR queue, tile/region reuse | Some paths perform avoidable image conversions — candidate, unmeasured |
+| `Capture/CaptureManager.swift` + `Capture/Deduplication/FrameDeduplicator.swift` | Adaptive capture + dedup behavior | **Audit-confirmed (2026-09-07):** similarity computed twice — `CaptureManager.swift:857` (logging) then `shouldKeepFrame` at :858 → `FrameDeduplicator.swift:34`. ~10k sampled pixels ×2; first frames/dimension changes exempt; the dHash path is NOT used here |
+| `Processing/FrameProcessingQueue.swift`, `Processing/OCR/VisionOCR.swift`, `FullFrameOCRCache.swift` | Durable OCR queue, tile/region reuse | **Audit-confirmed:** finalized-video OCR does a lossy TIFF/JPEG round trip (CGImage→NSImage→TIFF→JPEG 0.8→decode→BGRA: `StorageManager.swift:725,1230`, `FrameProcessingQueue.swift:1368,1582`); live Vision path is clean (CGDataProvider→`VNImageRequestHandler`, `VisionOCR.swift:619,713`); active-segment OCR reads WAL raw, no JPEG |
+| `Database/Queries/NodeQueries.swift` (`insertBatch`:43) | Node insertion | **Audit-found:** prepared statement but NO enclosing transaction — one autocommit per OCR node |
 | `Storage/VideoEncoder/HEVCEncoder.swift` | Hardware HEVC encoding (working) | Headroom unmeasured |
 | `Storage/FileManager/DirectoryManager.swift` | Chunk layout `chunks/YYYYMM/DD/<videoID>` | — |
 | `Storage/StorageManager.swift` (`SegmentRewriteArtifacts`, line 16) | Proof chunks get mutated: backup URL → replace, recovery modes | Sync must detect changed content, not assume immutability |
 | `Database/ReadConnectionSupport.swift` | Read-only DB open incl. key retrieval | Live WAL writes make naive copies unsafe — snapshots must use the SQLite backup API |
 | `video`/`segment`/`frame` tables | Authoritative file metadata for manifests | — |
 | `App/RetentionManager.swift` | Local deletions happen | Cloud deletion policy needed |
-| `Shared/Logging.swift` `Log.recordLatency` | Existing latency instrumentation | p50/p95 baselines not yet recorded for our paths |
+| `Shared/Logging.swift` `Log.recordLatency` | Latency instrumentation | **Audit finding:** hot paths have no direct `recordLatency` calls; harvestable instead: `[Queue-DIAG] … COMPLETED` (processing duration), `[DB-ACTOR] HOLD` (censored at 200 ms threshold), `[PERF]` p50/p95 summaries, `timeline.live_ocr.total_ms` (UI, keep separate). Stage 0 must add or harvest deliberately |
 
 ## D — Observable end state
 
@@ -72,28 +73,35 @@ Forbidden: `UI/` importing sync internals; sync writing anywhere in local storag
 - **Why separate:** optimization without a baseline is unfalsifiable; sync cost model needs real object counts; quality gates need a frozen reference. This is the stage that makes every later "verified by" honest.
 - **Reality check:** the author's real machine, real recording sessions, real storage root.
 
-### Track A — Performance optimization (quality-gated)
+### Track A — Performance optimization (quality-gated; candidates audit-verified 2026-09-07, magnitudes are hypotheses until Stage 0 measures)
 
-#### Stage A1 — Dedup/similarity double computation
+#### Stage A1 — Dedup similarity reuse
 
-- **Produces:** fix in `Capture/` removing the duplicate similarity computation (diagnostic + `shouldKeepFrame` adaptive path).
-- **Verified by:** corpus replay yields a bit-identical retained-frame ID sequence; measured CPU reduction in the capture loop; capture latency p95 not worse; module tests pass.
-- **Why separate:** smallest, provably behavior-preserving change; lands the gate workflow on an easy case first.
+- **Produces:** fix passing the already-computed similarity into `shouldKeepFrame` (keep no-reference/dimension guards), removing the second ~10k-pixel scan (`CaptureManager.swift:857-858`, `FrameDeduplicator.swift:34`).
+- **Verified by:** corpus replay yields a bit-identical retained-frame ID sequence; measured CPU reduction; capture latency p95 not worse; module tests pass.
+- **Why separate:** smallest provably behavior-preserving change; lands the gate workflow first.
 - **Reality check:** Stage 0 baseline numbers.
 
-#### Stage A2 — OCR image-conversion reduction
+#### Stage A2 — OCR-path efficiency (JPEG round trip, tile partition, ledger snapshots)
 
-- **Produces:** removal of avoidable pixel conversions on OCR paths in `Processing/`, plus decode/tile-reuse where equivalence is proven.
-- **Verified by:** OCR output equality gate vs the frozen Stage 0 reference across the whole corpus (any diff must be proven quality-neutral and explicitly approved); per-frame CPU/time delta measured; processing-queue tests pass.
-- **Why separate:** OCR text is the evidence Phase 2 attributes against — equality is mandatory before landing, and it needs its own gate.
+- **Produces:** (a) eliminate the finalized-video OCR TIFF/JPEG round trip by returning decoded BGRA through a storage API — **input pixels change** (lossy JPEG removed), so OCR output equivalence is a mandatory measured gate (text, confidence, boxes, search recall on real frames); (b) partition cached regions against changed tiles only, O(R×T)→O(T+R×C) with exactly-equal affected/unaffected lists required (`FullFrameOCRCache.swift:88`, `TileChangeDetector.swift:24`); (c) lightweight totals snapshots for the memory-attribution ledger instead of full sorted materializations (`VisionOCR.swift:314`, `Logging.swift:1077,1130`).
+- **Verified by:** per-subchange gates: (a) OCR-output equivalence or approved quality-neutral diff; (b) exactly-equal partition results on real tile/region sets; (c) identical totals/order with measured CPU reduction.
+- **Why separate:** OCR text is the Phase 2 evidence; (a) is the only change allowed to alter OCR output at all, and only through an explicit quality-neutral verdict.
 - **Reality check:** Stage 0 OCR reference on real frames.
 
-#### Stage A3 — Encode/storage efficiency (highest-risk gate)
+#### Stage A3 — DB node-insert transaction batching
 
-- **Produces:** measured-only changes to encoder settings or segment policies **where visual quality gates prove no readability loss**; otherwise a documented no-op with the numbers that justified rejection.
-- **Verified by:** visual quality gate vs baseline samples; storage growth delta; root `AGENTS.md` rule-6 UI smoke checks (timeline reopen, search overlay, storage picker) pass.
-- **Why separate:** this is where "aggressive" could destroy future attribution evidence; it gets the hardest gate and must be independently auditable.
-- **Reality check:** Stage 0 visual + storage baselines.
+- **Produces:** wrap `NodeQueries.insertBatch` stepping in one transaction inside a single actor operation (`FrameProcessingQueue.swift:1293`, `NodeQueries.swift:43`, `DatabaseManager.swift:361`); N autocommits → 1.
+- **Verified by:** replay real OCR results into a disposable DB; batch latency, commit count, WAL bytes measured; node ordering, offsets, encrypted text, rollback semantics unchanged.
+- **Why separate:** audit rank #1 (impact × confidence ÷ risk); touches durability semantics so it needs its own crash-safety verification.
+- **Reality check:** real OCR replay corpus.
+
+#### Stage A4 — Idle wakeups + encoder backpressure + storage policy (highest-risk gate)
+
+- **Produces:** (a) wake idle OCR workers on enqueue instead of 100 ms polling (`FrameProcessingQueue.swift:1127`, `DatabaseManager.swift:4010`) — lost-wakeup prevention required; (b) replace encoder readiness 1 ms sleep-polling (up to ~1000 wakeups/s backpressured, `HEVCEncoder.swift:513`) with readiness-driven suspension preserving cancellation/order/exactly-once append; (c) encoder settings/segment policy changes ONLY where Stage 0 visual gates prove no readability loss, else documented no-op.
+- **Verified by:** idle-wakeup and enqueue-to-start p95 measurements; append latency under backlog; visual quality gate; root `AGENTS.md` rule-6 UI smoke checks.
+- **Why separate:** scheduling/backpressure changes can introduce rare race bugs; they land last, behind the strongest verification.
+- **Reality check:** Stage 0 baselines.
 
 ### Track B — Cloud sync
 
