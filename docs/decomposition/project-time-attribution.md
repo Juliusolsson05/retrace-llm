@@ -49,7 +49,7 @@ Daily project-time report for every Retrace user: per-project durations with act
 
 ## D — Observable end state
 
-1. CLI (`retrace-attribution`) runs read-only, no app side effects.
+1. `retrace` (Phase 1 CLI, new subcommands) runs read-only, no app side effects.
 2. For any day: a **daily ledger** — per-project durations, activity descriptions, evidence links (frame IDs), explicit unknown time, cost report (tokens, $, model/prompt versions).
 3. Every retained frame analyzed multimodally (3.5 Flash-Lite); new/ambiguous clusters escalate to 3.8 Flash.
 4. Project memory persists across days: known projects auto-match at near-zero LLM cost; genuinely new work is detected, named, added to memory.
