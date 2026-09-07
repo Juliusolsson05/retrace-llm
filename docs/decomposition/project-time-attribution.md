@@ -1,40 +1,36 @@
 # Project Time Attribution — Staged Decomposition
 
-- **Status:** DRAFT — awaiting explicit user approval (no implementation until approved)
-- **Date:** 2026-09-07
+- **Status:** DRAFT — Phase 2. **Built only after `cloud-storage-sync.md` (Phase 1) ships.** No implementation until this decomposition is also explicitly approved.
+- **Date:** 2026-09-07 (revised same day: build order changed to cloud → CLI → LLM; harness approach switched to an existing framework with project memory and auto-mapping)
 - **Branch:** `feat/project-time-attribution`
-- **Methodology:** staged-decomposition (A → intermediate stages → D; each stage produces a named, independently verifiable artifact; fixtures come from real recordings, never imagination)
+- **Methodology:** staged-decomposition (each stage produces a named, independently verifiable artifact; real fixtures, never imagination)
 
 ---
 
 ## Product summary
 
-Ship, for every Retrace user, a daily project-time report: per-project durations with activity descriptions, produced by multimodal LLM analysis of recorded screen history. Projects are **dynamic** — the system auto-detects new work and reuses existing projects across days. Local compute is minimized: OCR stays on-device (Apple Vision, free); frames, OCR text, and metadata are analyzed in the cloud.
+Daily project-time report for every Retrace user: per-project durations with activity descriptions from multimodal analysis of recorded history. Projects are **dynamic** — auto-detected, auto-mapped, persistent in project memory. The agent harness runs on an **existing harness framework** (LangGraph or Pydantic AI — final pick at phase start) that provides persistence/memory, retries, and structured tool calls. The user never labels data; corrections are a product feature, not a data-preparation step.
 
-### Locked decisions (from design dialogue, 2026-09-07)
+### Locked decisions
 
 | Decision | Value |
 |---|---|
 | Every-frame model | **Gemini 3.5 Flash-Lite** (GA) — structured output + function calling, 1M context |
-| Escalation model | **Gemini 3.8 Flash** — new/ambiguous project clusters only |
-| Frame preparation | Downscale to ≤768px, `media_resolution=low` (~280 tokens/frame, not 1120 default) |
-| Batching | Overnight **Batch API** (JSONL, idempotency keys, 50% discount); Batch is **not idempotent on retry** — keys tracked locally |
-| Caching | Implicit context caching (default-on ≥2.5) for the project-roster system prompt |
-| Continuity | Learned anchors (repo names, domains, title patterns) + embedding centroids (Gemini embeddings, $0.006/M) — day-2+ mostly free |
-| OCR | Stays local. Cloud OCR rejected ($100+/mo/user vs free) |
-| Storage sync (B2/R2) | **Separate workstream, separate doc** — not a prerequisite |
-| Budget | ~$5–12/user/month approved (see cost model) |
-| First deliverable | Read-only CLI; in-app UI comes later |
-| Key handling | BYO API key (env/config); no keys in repo |
+| Escalation model | **Gemini 3.8 Flash** — new/ambiguous clusters only |
+| Frame prep | ≤768px downscale, `media_resolution=low` (~280 tokens/frame, not 1120 default) |
+| Batching | Overnight Batch API (JSONL, idempotency keys, 50% off); Batch is not idempotent on retry — keys tracked locally |
+| Caching | Implicit context caching (default-on) for the project-roster system prompt |
+| Harness | Existing framework — LangGraph (persistence + checkpointing) or Pydantic AI (agents + spend controls); decided at phase-2 start |
+| Project memory | Harness-native persistent store: known projects, learned identifiers (repos, domains, title patterns), recent decisions |
+| Auto-mapping | Harness maps observed activity → existing project from memory, or creates a new project when nothing matches |
+| Deterministic math | Timestamps → durations → totals computed in plain code; the model never does arithmetic |
+| OCR | Stays local (free); cloud OCR rejected ($100+/mo/user) |
+| Budget | ~$5–12/user/month approved |
+| Key handling | BYO API key (env/config); never in repo |
 
-### Cost model (to be pinned with `countTokens` in Stage 3)
+### Cost model (pin with `countTokens` in harness stage)
 
-Assumes 2,000 retained frames/day, 280 tokens/frame, ~100K text input, ~60K structured output:
-
-- Input: (2,000 × 280 + 100K) × $0.30/M ≈ $0.20/day
-- Output: 60K × $2.50/M ≈ $0.15/day
-- Realtime ≈ $10.5/mo → **batched ≈ $5.3/mo** → escalation adds ~$1–2/mo
-- **Working estimate: $5–12/user/month.** Anchor continuity should reduce this over time; the cost ledger measures reality.
+2,000 retained frames/day × 280 tok + ~100K text ≈ 660K input × $0.30/M ≈ $0.20/day; ~60K structured output × $2.50/M ≈ $0.15/day → realtime ≈ $10.5/mo, **batched ≈ $5.3/mo**, escalation +$1–2/mo. Working estimate **$5–12/user/month**; memory-based reuse should reduce it over time.
 
 ---
 
@@ -42,132 +38,109 @@ Assumes 2,000 retained frames/day, 280 tokens/frame, ~100K text input, ~60K stru
 
 | Artifact | Trusted for | Known limitations |
 |---|---|---|
-| `Database/ReadConnectionSupport.swift` (`SQLiteReadOnlyConnectionFactory`) | Read-only DB open incl. key retrieval | Snapshot consistency vs in-flight media writes not guaranteed — export must fence |
-| `segment` / `frame` / `node` / `video` tables | Real recorded evidence schema | — |
-| `Database/Queries/AppSegmentQueries.swift` | Heuristic app-usage estimate | Gap→previous-app with 120s cap; **not** ground truth |
-| `App/DataAdapter.swift` | Native/Rewind query patterns, paging | Default 500-row caps; URL backfill makes some URLs non-contemporaneous |
-| `Storage/ImageExtractor.swift` | Decoding frames from finalized video | Unfinalized frames only via raw WAL; redaction can rewrite videos post-hoc |
-| Processing OCR text in `node` | On-device text extraction | Two ingestion paths (finalized video → JPEG → pixels; WAL) |
-| `Shared/AppPaths.swift` | Configurable storage roots | — |
-| **Forbidden as bootstrap** | — | `AppCoordinator` / `ServiceContainer` run migrations, retention, recovery, workers. The CLI must never initialize them (`Sources/TestMostRecentFrame` is a negative example) |
+| Phase 1 output: cloud sync + evidence on B2 | Durable evidence source | Sync policy constraints (tombstones, revisions) |
+| `Database/ReadConnectionSupport.swift` | Read-only DB open incl. key retrieval | Snapshot vs in-flight writes — export fences |
+| `segment`/`frame`/`node` tables | Real recorded evidence | URL backfill makes some URLs non-contemporaneous |
+| `Storage/ImageExtractor.swift` | Frame decode from finalized video | Unfinalized frames only via WAL |
+| OCR text in `node` | On-device text extraction | Two ingestion paths |
+| **Forbidden bootstrap** | — | `AppCoordinator`/`ServiceContainer` run migrations, retention, workers — CLI must never initialize them |
 
-**Timing invariant (critical):** frames are packed into video at a nominal 30 FPS while capture occurs seconds apart. All time accounting uses **real capture timestamps**, never playback time.
+**Timing invariant:** frames are packed at nominal 30 FPS while capture occurs seconds apart. All time accounting uses **real capture timestamps**, never playback time.
 
 ## D — Observable end state
 
-1. New CLI (`retrace-attribution`) runs read-only against a Retrace database, no app side effects, safe while recording is active.
-2. For any chosen day it produces a **daily ledger**: stable project IDs across days, per-project durations, activity descriptions, evidence links (frame IDs), explicit unknown/unattributed time, and a cost report (tokens, $, model versions).
-3. Every retained frame of that day is analyzed multimodally (3.5 Flash-Lite, structured output); ambiguous/new clusters escalate to 3.8 Flash.
-4. Day-2+ behavior: confirmed projects auto-match via anchors at near-zero LLM cost; genuinely new work is detected, named, and added.
-5. User corrections (rename/merge/reassign) feed back into anchors and change next-day behavior.
-6. Ships with BYO key, cost ceiling guard, and `daily_metrics` instrumentation for runs.
+1. CLI (`retrace-attribution`) runs read-only, no app side effects.
+2. For any day: a **daily ledger** — per-project durations, activity descriptions, evidence links (frame IDs), explicit unknown time, cost report (tokens, $, model/prompt versions).
+3. Every retained frame analyzed multimodally (3.5 Flash-Lite); new/ambiguous clusters escalate to 3.8 Flash.
+4. Project memory persists across days: known projects auto-match at near-zero LLM cost; genuinely new work is detected, named, added to memory.
+5. `retrace-attribution correct` (rename/merge/reassign) updates project memory and changes subsequent days' behavior — a product feature.
+6. BYO key, spend ceiling guard, `daily_metrics` instrumentation.
 
 ---
 
-## Isolation — the hard component
+## Isolation
 
-The genuinely hard part is **attribution reconciliation**: merging anchor matches, model candidates, real capture timestamps, idle/lock gaps, and user corrections into one consistent ledger without double-counting or silent assignment.
+The coordination risk is **state ownership**: what the harness believes (memory, decisions) vs what code computes (durations). Rule: the harness owns *decisions and memory*; plain code owns *arithmetic and the ledger format*.
 
-- **Location:** new top-level module `Attribution/` (own `AGENTS.md`), created in Stage 1 alongside the CLI target `Sources/AttributionCLI/` (pattern: existing `Sources/TestMostRecentFrame`).
-- **Single consumer:** the reporting stage. Nothing else may import `Attribution/Reconciliation/`.
-- **Forbidden importers of reconciliation:** `UI/`, `Capture/`, `Storage/`, `App/`, `Database/`. Reconciliation consumes an evidence-pack abstraction and must not know where evidence came from.
-- **Forbidden imports inside the CLI:** `App/` (coordinator/container), any module-mutating code path.
+- **Location:** `Attribution/` top-level module (own `AGENTS.md`, created in the first implementation commit of this phase) + `Sources/AttributionCLI/`.
+- **Single consumer of the accounting layer:** the report command.
+- **Forbidden:** `UI/`, `Capture/`, `Storage/`, `App/`, `Database/` importing attribution internals; attribution importing app bootstrap; the harness writing the ledger directly (it only proposes; code disposes).
 
 ---
 
 ## Stages
 
-### Stage 0 — Evidence contract + real corpus (instrumentation first)
+### Stage 0 — Evidence contract + real corpus
 
-- **Produces:** `evidence-pack-v1` schema (segments, real capture timestamps, app/title/URL metadata, OCR text refs, downscaled frame refs, available lock/idle evidence, provenance hashes) + 3–5 real days exported from the author's Retrace database into a local fixtures directory (private, out of git; schema + sanitized samples committed).
-- **Verified by:** schema validation of every exported day; row counts reconcile against direct SQL; spot-check exported frames against DB frame records; read-only assertion (source DB untouched, verified by mtime + open flags).
-- **Why separate:** every later stage's tests are built from this corpus. Frame volume, segment shapes, and idle patterns measured here replace assumptions; guessed fixtures are the exact failure mode this methodology exists to prevent.
-- **Reality check:** the author's actual recorded working days, including multi-project switching.
+- **Produces:** `evidence-pack-v1` schema (segments, real capture timestamps, app/title/URL metadata, OCR text refs, downscaled frame refs, lock/idle evidence, provenance hashes) + 3–5 real exported days (private corpus, out of git; schema + sanitized samples committed).
+- **Verified by:** schema validation of every day; counts reconcile with SQL; frame spot-checks; read-only assertion on the source DB.
+- **Why separate:** every later stage builds on this corpus; real shapes and volumes replace assumptions.
+- **Reality check:** the author's actual recorded working days.
 
 ### Stage 1 — Read-only evidence exporter CLI
 
-- **Produces:** executable `retrace-attribution export --day YYYY-MM-DD --out DIR`: read-only DB access, frame decode + downscale (≤768px JPEG), OCR text assembly, manifest with provenance (frameID → source, SHA-256). First commit creates `Attribution/` + `AGENTS.md` entries.
-- **Verified by:** end-to-end run against the real DB; output validates against Stage 0 schema; grep gate script asserting zero imports of `App/` in the CLI target; runs concurrently with a live recording session without side effects.
-- **Why separate:** the harness and reconciliation must develop against a stable export contract; exporter correctness is independently checkable without any LLM work.
-- **Reality check:** built and measured on the Stage 0 corpus.
+- **Produces:** `retrace-attribution export --day ... --out DIR`: read-only DB access, frame decode + ≤768px downscale, OCR assembly, manifest with provenance. Creates `Attribution/` + AGENTS.md entries.
+- **Verified by:** end-to-end on the real DB; schema conformance; grep gate asserting zero `App/` imports; concurrent-with-recording safety.
+- **Why separate:** the harness develops against a stable export contract.
+- **Reality check:** Stage 0 corpus.
 
 ### Stage 2 — Observed-case catalog (automated)
 
-- **Produces:** `docs/decomposition/observed-catalog.md` enumerating segment shapes actually observed (per-app editing, browsing per-site, terminal, meetings, idle/lock gaps, URL-backfill anomalies, rapid project switching) with frequencies, generated by analysis scripts over the Stage 0 corpus. The user answers only targeted single questions when a semantic ambiguity blocks design (e.g. "should terminal-with-no-URL count as its own activity?") — no labeling session.
-- **Verified by:** coverage check — every segment in the corpus maps to at least one catalog case; catalog generated by committed, re-runnable scripts rather than hand-typing.
-- **Why separate:** segment shapes and frequencies must be measured before reconciliation rules or prompts are designed; invented shapes are the failure mode this methodology prevents.
-- **Reality check:** directly from Stage 0/1 exports.
+- **Produces:** `observed-catalog.md` — segment shapes and frequencies from the corpus, generated by committed scripts. User answers only blocking design questions (if any).
+- **Verified by:** coverage check — every corpus segment maps to a catalog case; script-generated, not hand-typed.
+- **Why separate:** prompts and memory schema must be designed against measured shapes.
+- **Reality check:** Stage 0/1 exports.
 
-### Stage 3 — Gemini harness (transport, not intelligence)
+### Stage 3 — Harness foundation on existing framework
 
-- **Produces:** `Attribution/Harness/`: request builder (frames + OCR + cached roster layout, `media_resolution=low`, responseSchema), `countTokens` pre-flight (pins the real cost table), Batch JSONL submit/poll with **local idempotency-key ledger**, retry policy, spend ceiling guard, cost ledger, and recorded-response fixtures (canned JSON) for offline replay. Swift SDK (Firebase AI Logic standalone) vs thin REST client decided here.
-- **Verified by:** countTokens report within ±20% of the cost model above; offline replay suite passes with no network; one opt-in live smoke call over one hour of corpus; cost-ledger totals match provider-reported usage.
-- **Why separate:** transport correctness (idempotency, spend caps, retries) is testable with zero attribution logic and isolates financial risk before intelligence is added.
-- **Reality check:** real corpus frames; real token counts replace the estimate table.
+- **Produces:** framework decision (LangGraph vs Pydantic AI, documented rationale) + running skeleton: agent graph with tools (query evidence, read/write project memory, request escalation), checkpointed persistence, `countTokens` pre-flight pinning real cost, Batch submission with local idempotency-key ledger, spend ceiling, cost ledger, recorded-response replay fixtures.
+- **Verified by:** offline replay suite green (no network); countTokens within ±20% of the cost model; one opt-in live smoke over one corpus hour; crash/resume of a batch preserves exactly-once keys.
+- **Why separate:** transport, persistence, and spend correctness are testable with zero attribution intelligence; isolates financial risk.
+- **Reality check:** corpus frames, real token counts.
 
-### Stage 4 — Continuity: anchors + embeddings
+### Stage 4 — Project memory + auto-mapping
 
-- **Produces:** `Attribution/Continuity/`: anchor store (learned identifiers: repo names, domains, title patterns — harvested from confirmed assignments and corrections), embedding-centroid matcher (Gemini embeddings API), assignment logic → existing project | new-cluster flag. Stage 2 catalog shapes the matcher's segmentation; first corrections seed initial anchors.
-- **Verified by:** tests against the real corpus: cold-start day produces a small, sensible set of new clusters (count sanity-checked, not gold-labeled); measured LLM-bound segment reduction on day 2 vs day 1 of the corpus; applied corrections verifiably change subsequent matching.
-- **Why separate:** the cheap deterministic path must be proven before prompts lean on it; poisoned anchors would corrupt reconciliation silently.
-- **Reality check:** Stage 2 labels.
+- **Produces:** memory schema (projects: id, names/aliases, learned identifiers — repos, domains, title patterns; decisions log) + the mapping agent: existing-project match from memory, or new-project proposal via 3.8 Flash escalation; terse structured labels per frame batch (3.5 Flash-Lite).
+- **Verified by:** corpus replay — day 1 cold start yields a small sensible cluster set; day 2 memory reuse measurably reduces LLM-bound segments; a correction updates memory and changes subsequent matching (demonstrated on corpus).
+- **Why separate:** memory correctness must be proven before reports depend on it; poisoned memory silently corrupts everything downstream.
+- **Reality check:** real corpus days.
 
-### Stage 5 — Attribution reconciliation (hard component — invariants first)
+### Stage 5 — Deterministic accounting layer
 
-- **Produces:** `Attribution/Reconciliation/`: interval construction from real capture timestamps, candidate merging (anchors + model output), boundary rules, unknown-time entries, no-double-count invariant; versioned `DailyLedger` (hash-chained to evidence).
-- **Verified by:** tests written before implementation, in two tiers:
-  1. **Label-free invariants** (written now, from Stage 0/1 real corpus): zero-overlap across intervals, no double-counting (sum of per-project durations ≤ observed active time), unknown time explicitly non-negative and visible, deterministic replay from the same evidence pack + prompts, correction application is monotonic (a correction never widens disagreement elsewhere).
-  2. **Correction-driven regression fixtures** (accumulate from Stage 7 real use): every user correction is recorded with provenance and becomes a locked regression fixture — the report may evolve, but that corrected case may never regress. A failing test against a real correction is never edited to go green; the code is wrong.
-  Accuracy thresholds tighten over time as the correction corpus grows; v1 ships with invariant guarantees and visible unknowns rather than claimed accuracy numbers.
-- **Why separate:** this is the multi-source truth merger. Per methodology it needs its own module and single consumer; its bugs are ownership bugs that masquerade as report bugs.
-- **Reality check:** real corpus invariants; real corrections as they occur.
+- **Produces:** plain-code ledger builder: intervals from real capture timestamps + harness decisions → per-project durations, unknown time, no-double-count; versioned `DailyLedger` (hash-chained to evidence + prompt versions).
+- **Verified by:** label-free invariant tests written before implementation against the real corpus: zero-overlap, sum(per-project) ≤ observed active time, non-negative unknown, deterministic replay from identical inputs, correction application monotonic.
+- **Why separate:** arithmetic and truth-merging must not live inside prompt space; invariants are provable without any ground-truth labels.
+- **Reality check:** real corpus invariants.
 
-### Stage 6 — Interpretation + escalation prompting
+### Stage 6 — Report + corrections + metrics
 
-- **Produces:** versioned prompt + schema pairs: (a) per-batch frame labeling (3.5 Flash-Lite, terse JSON labels), (b) new-cluster naming/description (3.8 Flash), (c) daily activity summary. Prompt fixtures + model/prompt version stamps in the ledger.
-- **Verified by:** schema validation 100% on replay; live opt-in run reviewed by the user on a genuinely new project; escalation rate and cost within guardrails.
-- **Why separate:** prompt quality iterates independently of transport and reconciliation; version pinning keeps runs reproducible.
-- **Reality check:** real ambiguous clusters surfaced by Stages 4–5 on the corpus.
-
-### Stage 7 — Report, corrections, metrics
-
-- **Produces:** `retrace-attribution report --day ...` (per-project table, descriptions, unknown time, cost); `retrace-attribution correct ...` (rename/merge/reassign → anchor feedback); `daily_metrics` emission; ledger versioning.
-- **Verified by:** end-to-end on corpus days — invariant suite green; corrections applied via `correct` verifiably change next-day anchor matching; metrics recorded; report reviewed by the user in normal use (their corrections feed Stage 5's regression corpus).
-- **Why separate:** this is the user-facing contract and the feedback loop that makes day-2+ cheap; it must not entangle reconciliation internals.
-- **Reality check:** labeled days + explicit user review.
-
-### Explicitly separate workstreams (own decomposition docs, not this one)
-
-- Capture/OCR/encoding performance optimization (requires its own quality baseline first)
-- Cloud storage sync (B2/R2, revision + redaction-propagation policy)
-- In-app UI integration of reports
+- **Produces:** `retrace-attribution report --day ...` (per-project table, descriptions, unknown, cost); `correct` commands feeding project memory; `daily_metrics`; end-to-end docs.
+- **Verified by:** report renders from ledger deterministically; corrections change next-day behavior on corpus; metrics recorded; user reviews real reports in normal use.
+- **Why separate:** user-facing contract; feedback loop that makes day-2+ cheap.
+- **Reality check:** real corpus + user's own use.
 
 ---
 
-## Unknowns (explicit — none of these are silently decided)
+## Unknowns (explicit)
 
-1. **Real retained-frames/day volume** — measured in Stage 0; cost model is sensitive to it.
-2. **Idle/lock evidence completeness** in the DB today — if gaps exist, a capture-side evidence addition becomes its own small workstream; the CLI proceeds without it meanwhile (unknown time stays visible).
-3. **Exact tokens/frame at `low` for 3.5 Flash-Lite** — 280 is the documented family table; pinned by countTokens in Stage 3.
-4. **Swift SDK viability** (Firebase AI Logic standalone API-key auth) vs thin REST client — decided Stage 3.
-5. **Attribution accuracy thresholds** — no upfront ground-truth labels exist by design; v1 ships on invariants + visible unknowns, thresholds tighten as the correction corpus accumulates (honest limitation: accuracy is unverifiable until you correct real reports).
-6. **Privacy copy for shipped users** (frames leave the device by design) — product decision before public release, not before CLI.
-7. **Rewind-history scope** — assumed native-only for v1; Rewind import support deferred.
-8. **Paid-tier rate limits under batch** — monitored via cost ledger from Stage 3 onward.
-9. **Offline/non-computer work policy** — out of scope for v1; observed computer time only (pending user confirmation).
+1. Real retained-frames/day volume — measured Stage 0; cost is sensitive to it.
+2. Exact tokens/frame at `low` for 3.5 Flash-Lite — pinned Stage 3.
+3. Framework pick (LangGraph vs Pydantic AI) — Stage 3, with rationale.
+4. Language boundary — Swift exporter + Python harness is the leading shape (both candidate frameworks are Python); confirmed at Stage 3.
+5. Accuracy is not claimed until real-use review; v1 guarantees invariants + visible unknowns (honest limitation — no upfront labels exist by design).
+6. Idle/lock evidence completeness in the DB — if gapped, capture-side evidence becomes a small separate workstream; CLI proceeds meanwhile.
+7. Privacy copy for shipped users (frames leave device by design) — before public release.
+8. Rewind-history scope — native-only v1.
+9. Offline/non-computer work — out of scope v1.
 
 ## Fixture plan
 
-- Stage 0/1 export real days → private corpus (out of git; `.gitignore`d) + committed schema + sanitized samples.
-- Stage 2 catalog is script-generated from that corpus — never hand-typed.
-- Stage 3 records live API responses → replay fixtures so the entire pipeline is testable offline, deterministically, and free.
-- Stage 5 tier-1 tests (invariants) are written **before** reconciliation code, against the real corpus.
-- **User corrections during real use are the label source**: each correction is recorded with provenance and becomes a locked regression fixture (tier 2). No upfront labeling session; no fixture typed from imagination.
-- Optional future auto-label source: cross-referencing git-commit timestamps from the user's actual project repositories to verify coding-time attribution.
+- Stage 0/1: real exported days (private corpus, gitignored) + committed schema + sanitized samples.
+- Stage 2: script-generated catalog.
+- Stage 3: recorded live API responses → replay fixtures for fully offline, deterministic, free pipeline tests.
+- Stage 5: invariant tests written before code, against the real corpus.
+- No fixture typed from imagination; no human labeling sessions.
 
-## Conventions compliance (agent-code-conventions)
+## Conventions compliance
 
-- Worktree `.worktrees/project-time-attribution`, branch `feat/project-time-attribution`; this document is the first commit on the branch.
-- After approval: GitHub issue `feat(attribution): project-time attribution CLI with Gemini harness` created before implementation; stages reference it.
-- One conventional commit per stage artifact; PR opened fully built (implementation, tests, verification) and linked via `Refs`/`Fixes`; never auto-merged.
-- Baseline `swift build`/`swift test` verification runs at the start of Stage 1 implementation (docs-only commits precede it).
+- Branch/worktree as Phase 1; conventional commits per stage; GitHub issue `feat(attribution): project-time attribution harness` created before this phase's implementation; PR fully built, linked, never auto-merged.
