@@ -1,6 +1,6 @@
 # Project Time Attribution — Staged Decomposition
 
-- **Status:** DRAFT — Phase 2. **Built only after `cloud-storage-sync.md` (Phase 1) ships.** No implementation until this decomposition is also explicitly approved.
+- **Status:** DRAFT — Phase 2. **Built only after `optimization-and-cloud-sync.md` (Phase 1: performance optimization + cloud sync + CLI) ships.** No implementation until this decomposition is also explicitly approved.
 - **Date:** 2026-09-07 (revised same day: build order changed to cloud → CLI → LLM; harness approach switched to an existing framework with project memory and auto-mapping)
 - **Branch:** `feat/project-time-attribution`
 - **Methodology:** staged-decomposition (each stage produces a named, independently verifiable artifact; real fixtures, never imagination)
@@ -38,7 +38,7 @@ Daily project-time report for every Retrace user: per-project durations with act
 
 | Artifact | Trusted for | Known limitations |
 |---|---|---|
-| Phase 1 output: cloud sync + evidence on B2 | Durable evidence source | Sync policy constraints (tombstones, revisions) |
+| Phase 1 output: optimized pipeline + cloud sync on B2 + `retrace` CLI | Durable evidence source, existing CLI to extend | Sync policy constraints (tombstones, revisions) |
 | `Database/ReadConnectionSupport.swift` | Read-only DB open incl. key retrieval | Snapshot vs in-flight writes — export fences |
 | `segment`/`frame`/`node` tables | Real recorded evidence | URL backfill makes some URLs non-contemporaneous |
 | `Storage/ImageExtractor.swift` | Frame decode from finalized video | Unfinalized frames only via WAL |
@@ -53,7 +53,7 @@ Daily project-time report for every Retrace user: per-project durations with act
 2. For any day: a **daily ledger** — per-project durations, activity descriptions, evidence links (frame IDs), explicit unknown time, cost report (tokens, $, model/prompt versions).
 3. Every retained frame analyzed multimodally (3.5 Flash-Lite); new/ambiguous clusters escalate to 3.8 Flash.
 4. Project memory persists across days: known projects auto-match at near-zero LLM cost; genuinely new work is detected, named, added to memory.
-5. `retrace-attribution correct` (rename/merge/reassign) updates project memory and changes subsequent days' behavior — a product feature.
+5. `retrace correct` (rename/merge/reassign) updates project memory and changes subsequent days' behavior — a product feature.
 6. BYO key, spend ceiling guard, `daily_metrics` instrumentation.
 
 ---
@@ -62,7 +62,7 @@ Daily project-time report for every Retrace user: per-project durations with act
 
 The coordination risk is **state ownership**: what the harness believes (memory, decisions) vs what code computes (durations). Rule: the harness owns *decisions and memory*; plain code owns *arithmetic and the ledger format*.
 
-- **Location:** `Attribution/` top-level module (own `AGENTS.md`, created in the first implementation commit of this phase) + `Sources/AttributionCLI/`.
+- **Location:** `Attribution/` top-level module (own `AGENTS.md`, created in the first implementation commit of this phase) + `Sources/RetraceCLI/` (extended from Phase 1).
 - **Single consumer of the accounting layer:** the report command.
 - **Forbidden:** `UI/`, `Capture/`, `Storage/`, `App/`, `Database/` importing attribution internals; attribution importing app bootstrap; the harness writing the ledger directly (it only proposes; code disposes).
 
@@ -79,7 +79,7 @@ The coordination risk is **state ownership**: what the harness believes (memory,
 
 ### Stage 1 — Read-only evidence exporter CLI
 
-- **Produces:** `retrace-attribution export --day ... --out DIR`: read-only DB access, frame decode + ≤768px downscale, OCR assembly, manifest with provenance. Creates `Attribution/` + AGENTS.md entries.
+- **Produces:** `retrace export --day ... --out DIR`: read-only DB access, frame decode + ≤768px downscale, OCR assembly, manifest with provenance. Creates `Attribution/` + AGENTS.md entries.
 - **Verified by:** end-to-end on the real DB; schema conformance; grep gate asserting zero `App/` imports; concurrent-with-recording safety.
 - **Why separate:** the harness develops against a stable export contract.
 - **Reality check:** Stage 0 corpus.
@@ -114,7 +114,7 @@ The coordination risk is **state ownership**: what the harness believes (memory,
 
 ### Stage 6 — Report + corrections + metrics
 
-- **Produces:** `retrace-attribution report --day ...` (per-project table, descriptions, unknown, cost); `correct` commands feeding project memory; `daily_metrics`; end-to-end docs.
+- **Produces:** `retrace report --day ...` (per-project table, descriptions, unknown, cost); `correct` commands feeding project memory; `daily_metrics`; end-to-end docs.
 - **Verified by:** report renders from ledger deterministically; corrections change next-day behavior on corpus; metrics recorded; user reviews real reports in normal use.
 - **Why separate:** user-facing contract; feedback loop that makes day-2+ cheap.
 - **Reality check:** real corpus + user's own use.
