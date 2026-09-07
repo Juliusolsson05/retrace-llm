@@ -55,6 +55,8 @@ retrace/
 ├── AI_ISSUE_TEMPLATE.md         # Canonical markdown template for AI-authored bug reports
 ├── README.md                    # Human-readable project overview
 ├── CONTRIBUTING.md              # Contribution guidelines
+├── docs/
+│   └── decomposition/           # Staged decomposition docs for large features
 ├── Package.swift                # Swift Package Manager configuration
 ├── scripts/                     # Build/release/validation scripts
 │   ├── release.sh               # End-to-end release automation
