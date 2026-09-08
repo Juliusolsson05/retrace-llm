@@ -35,8 +35,9 @@ enum DocumentQueries {
         }
 
         let segmentID = sqlite3_column_int64(statement, 0)
-        sqlite3_reset(statement)
-        sqlite3_clear_bindings(statement)
+        // Reset retains the allocation; finish this query before replacing its pointer.
+        sqlite3_finalize(statement)
+        statement = nil
 
         let existingDocidSQL = """
             SELECT docid
@@ -128,8 +129,8 @@ enum DocumentQueries {
             )
         }
 
-        sqlite3_reset(statement)
-        sqlite3_clear_bindings(statement)
+        sqlite3_finalize(statement)
+        statement = nil
 
         guard sqlite3_prepare_v2(db, deleteSearchSQL, -1, &statement, nil) == SQLITE_OK else {
             throw DatabaseError.queryFailed(

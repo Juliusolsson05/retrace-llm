@@ -816,4 +816,45 @@ final class QueryBuilderTests: XCTestCase {
         let count = try DocumentQueries.getCount(db: db!)
         XCTAssertEqual(count, 7)
     }
+
+    func testDocumentQueries_InsertFinalizesFrameLookup() throws {
+        let document = IndexedDocument(
+            id: 0, frameID: try createTestFrame(), timestamp: Date(), content: "Statement lifetime"
+        )
+        _ = try DocumentQueries.insert(db: db!, document: document)
+        assertNoOwnedStatements(sql: "SELECT segmentId FROM frame WHERE id = ? LIMIT 1;")
+    }
+
+    func testDocumentQueries_DuplicateInsertFinalizesFrameLookup() throws {
+        let document = IndexedDocument(
+            id: 0, frameID: try createTestFrame(), timestamp: Date(), content: "Duplicate document"
+        )
+        _ = try DocumentQueries.insert(db: db!, document: document)
+        XCTAssertThrowsError(try DocumentQueries.insert(db: db!, document: document))
+        assertNoOwnedStatements(sql: "SELECT segmentId FROM frame WHERE id = ? LIMIT 1;")
+    }
+
+    func testDocumentQueries_DeleteFinalizesJunctionDelete() throws {
+        let document = IndexedDocument(
+            id: 0, frameID: try createTestFrame(), timestamp: Date(), content: "Delete document"
+        )
+        let id = try DocumentQueries.insert(db: db!, document: document)
+        try DocumentQueries.delete(db: db!, id: id)
+        assertNoOwnedStatements(sql: "DELETE FROM doc_segment WHERE docid = ?;")
+    }
+
+    private func assertNoOwnedStatements(sql: String, file: StaticString = #filePath, line: UInt = #line) {
+        var matches: [OpaquePointer] = []
+        var statement = sqlite3_next_stmt(db, nil)
+        while let current = statement {
+            if let text = sqlite3_sql(current), String(cString: text) == sql {
+                matches.append(current)
+            }
+            statement = sqlite3_next_stmt(db, current)
+        }
+        XCTAssertTrue(matches.isEmpty, "Leaked \(matches.count) locally owned statements: \(sql)", file: file, line: line)
+        // Clean only these known application statements after a failed assertion,
+        // never SQLite's internal FTS statements.
+        matches.forEach { sqlite3_finalize($0) }
+    }
 }
