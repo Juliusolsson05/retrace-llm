@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import SQLite3
 import Shared
 @testable import Database
 
@@ -783,5 +784,35 @@ final class IntegrationTests: XCTestCase {
         // Database should still work
         let retrieved = try await database.getVideoSegment(id: storedVideoID)
         XCTAssertNotNil(retrieved)
+    }
+
+    func testCheckpoint_ReportsBusyReaderAndSucceedsAfterRelease() async throws {
+        let segment = VideoSegment(
+            id: VideoSegmentID(value: 0), startTime: Date(), endTime: Date(),
+            frameCount: 1, fileSizeBytes: 1024, relativePath: "checkpoint-reader.mp4",
+            width: 1920, height: 1080, source: .native
+        )
+        _ = try await insertVideoSegment(segment)
+
+        do {
+            var reader: OpaquePointer?
+            XCTAssertEqual(sqlite3_open_v2(databasePath, &reader, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+            let handle = try XCTUnwrap(reader)
+            defer {
+                sqlite3_exec(handle, "ROLLBACK;", nil, nil, nil)
+                sqlite3_close(handle)
+            }
+            // Pin a real WAL read snapshot before the writer advances it.
+            XCTAssertEqual(sqlite3_exec(handle, "BEGIN; SELECT COUNT(*) FROM video;", nil, nil, nil), SQLITE_OK)
+            _ = try await insertVideoSegment(segment)
+            do {
+                try await database.checkpoint(maxRetries: 1)
+                XCTFail("A pinned reader must not be reported as a completed TRUNCATE checkpoint")
+            } catch StorageError.walCheckpointFailed(let retries) {
+                XCTAssertEqual(retries, 1)
+            }
+        }
+
+        try await database.checkpoint(maxRetries: 1)
     }
 }

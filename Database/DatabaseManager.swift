@@ -3472,16 +3472,14 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
 
-        let sql = "PRAGMA wal_checkpoint(TRUNCATE);"
         var lastError: String?
 
         for attempt in 1...maxRetries {
             let checkpointStart = CFAbsoluteTimeGetCurrent()
 
-            var errorMessage: UnsafeMutablePointer<CChar>?
-            let result = sqlite3_exec(db, sql, nil, nil, &errorMessage)
-            let message = errorMessage.map { String(cString: $0) }
-            sqlite3_free(errorMessage)
+            // The PRAGMA returns SQLITE_OK even when its result row says busy.
+            // The checkpoint API instead reports incomplete TRUNCATE as SQLITE_BUSY.
+            let result = sqlite3_wal_checkpoint_v2(db, nil, SQLITE_CHECKPOINT_TRUNCATE, nil, nil)
 
             if result == SQLITE_OK {
                 let elapsedMs = (CFAbsoluteTimeGetCurrent() - checkpointStart) * 1000
@@ -3494,7 +3492,7 @@ public actor DatabaseManager: DatabaseProtocol {
                 return
             }
 
-            lastError = message ?? "Unknown error"
+            lastError = String(cString: sqlite3_errmsg(db))
             Log.error("[DatabaseManager] WAL checkpoint failed (attempt \(attempt)/\(maxRetries)): \(lastError!)", category: .database)
 
             // Exponential backoff before retry
