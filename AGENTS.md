@@ -70,7 +70,10 @@ retrace/
 │   │   ├── SyncPlanner.swift    # Read-only chunk hashing/revision planning and pending-purge suppression
 │   │   ├── SyncEngine.swift     # Gated encrypted apply, current snapshot lineage, durable upload/deletion retries
 │   │   ├── SnapshotStore.swift  # SQLite online backup, optional RBC1 encryption, dual-hash lineage and empty-target restore
-│   │   └── Tests/RetraceCLITests.swift # SQLite/FileManager fixtures and offline B2 upload/verify/restore cycles
+│   │   ├── BaselineSampler.swift # Real-session process/log sampling and offline log harvesting for baseline reports
+│   │   └── Tests/
+│   │       ├── RetraceCLITests.swift # SQLite/FileManager fixtures and offline B2 upload/verify/restore cycles
+│   │       └── BaselineSamplerTests.swift # Real-emit-format log fixtures, session self-sampling and CLI mode routing
 │   ├── TestMostRecentFrame/     # Existing diagnostic executable
 │   └── QueryRewindApps/         # Existing Rewind query executable
 ├── scripts/                     # Build/release/validation scripts
@@ -232,7 +235,7 @@ retrace/
 | **SEARCH**     | `Search/`     | `Search/AGENTS.md`     | Query parsing, FTS5 queries, result ranking (no vector search yet) |
 | **MIGRATION**  | `Migration/`  | `Migration/AGENTS.md`  | Import from Rewind AI (Rewind only, others planned)                |
 | **APP**        | `App/`        | —                      | Coordinator, DI container, data adapter, lifecycle management      |
-| **CLI**        | `Sources/RetraceCLI/` | root guide       | Read-only evidence, bounded inventory, gated encrypted sync, snapshot/verify/restore and independent metrics |
+| **CLI**        | `Sources/RetraceCLI/` | root guide       | Read-only evidence, bounded inventory, gated encrypted sync, snapshot/verify/restore, observational baseline sampling and independent metrics |
 | **UI**         | `UI/`         | `UI/AGENTS.md`         | SwiftUI interface (timeline, dashboard, settings, search)          |
 
 **Rule**: Each agent should **ONLY** modify files in their assigned module directory. Cross-module changes require explicit coordination.

@@ -71,6 +71,8 @@ enum CLICommand {
         "swift run retrace-cli help",
         "swift run retrace-cli status [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli baseline [--storage-root PATH] [--state-root PATH]",
+        "swift run retrace-cli baseline --session SECONDS [--storage-root PATH] [--state-root PATH]",
+        "swift run retrace-cli baseline --harvest-log [PATH] [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli sync --dry-run [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli sync --apply --phrase-from-stdin [--snapshot-current PATH] [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli sync-plan --purge-day YYYY-MM-DD [--storage-root PATH] [--state-root PATH]",
@@ -102,6 +104,8 @@ enum CLICommand {
         "Export frame keys: schemaVersion=1, frameId, timestampMs, videoId, videoFrameIndex, segmentId, appBundleId, appName, windowName, browserUrl. IDs/timestamps/indexes are integers; missing video references and metadata are explicit null. appName is the bundle-ID suffix used by DataAdapter, not an installed-app display-name lookup.",
         "Export defaults to --limit 5000 (allowed 1...50000). Summary frameCount, videoCount and segmentCount describe emitted frames and their distinct non-null video/segment IDs; limitApplied is the numeric limit. One visible lookahead row determines truncated. Truncation and empty days exit 0. On failure, already emitted lines remain valid but the export is incomplete; check exitCode/status. Counts and memory are bounded; SQLite may scan additional hidden/deleted rows.",
         "Baseline also inventories chunks/YYYYMM/DD/positive-decimal-videoID (no extension). Nonempty regular files are canonical candidates; zero-byte candidates are incomplete. Other files, directories, symlinks and errors are reported separately, without individual names.",
+        "Baseline --session SECONDS (1...3600) samples the running Retrace process on a 1s cadence (proc_pidinfo CPU as percent of one core, phys_footprint bytes), tails ~/Library/Logs/Retrace/retrace.log with rotation awareness, and reports the canonical chunk byte delta between the start and end scans. If Retrace is not running, process fields are null with processFound=false; sampling disappearance is evidence, never a failure. CPU percent of one core can exceed 100 with multiple busy threads.",
+        "Baseline --harvest-log [PATH] parses an existing log offline (default ~/Library/Logs/Retrace/retrace.log; a missing default reports logPresent=false, a missing explicit PATH exits 3 log_unreadable). Harvested shapes mirror the production emit sites: [Queue-DIAG] Worker COMPLETED durations, [PERF] p50/p95 summaries and slow samples, and Deduplication analysis outcomes with a decile similarity histogram (n/a similarities count toward outcomes only). Lines carrying one of those markers but failing the real emit format count as malformedMetricLines and are skipped. Percentiles are nearest-rank like the app's LatencyRecorder; absent evidence encodes as JSON null, not zero.",
         "Baseline file bytes are logical sizes, not allocated disk space. Month is the validated calendar directory label, not a timestamp or timezone inference. Files may be orphaned or unfinished; baseline performs no decoding, hashing or DB-to-file reconciliation. File counts do not equal frame counts; many frames share a video.",
         "Inventory is bounded to 100000 entries and 10 seconds between metadata operations. A filesystem call itself may take longer. A limit or I/O error returns partial counts and exit 4. Missing chunks is empty only when the database has no video rows.",
         "Live results are observational, not an atomic database/filesystem snapshot. Elapsed time measures this command only, not OCR, compression or a performance improvement.",
@@ -131,8 +135,72 @@ enum CLICommand {
             if let command = arguments.first, ["snapshot", "verify", "restore"].contains(command) {
                 return await executeSnapshotCommand(command: command, arguments: Array(arguments.dropFirst()), readPhrase: readPhrase)
             }
+            if arguments.first == "baseline",
+               arguments.dropFirst().contains(where: { $0 == "--session" || $0.hasPrefix("--session") || $0 == "--harvest-log" }) {
+                return await executeBaselineSampling(arguments: Array(arguments.dropFirst()))
+            }
             return execute(arguments: arguments)
         }.value
+    }
+
+    private static func executeBaselineSampling(arguments: [String]) async -> CLIResult {
+        let started = ProcessInfo.processInfo.systemUptime
+        var report: BaselineReport
+        var metrics: CLIStateMetrics?
+        do {
+            let options = try parseOptions(arguments, baselineCommand: true)
+            let session = options["--session"]
+            let harvest = options["--harvest-log"]
+            guard session == nil || harvest == nil else { throw usage() }
+            let root = try localPath(options["--storage-root"] ?? AppPaths.storageRoot).resolvingSymlinksInPath()
+            let state = try localPath(options["--state-root"] ?? "~/Library/Application Support/RetraceCLI")
+            metrics = try CLIStateMetrics(root: state, sourceRoot: root)
+            try metrics?.record(command: "baseline", outcome: "started")
+            if let harvest {
+                // An explicit path must exist; the default log merely may not have been
+                // written yet, and absence is recorded rather than failing the report.
+                if harvest == "true" {
+                    report = BaselineSampler.harvestOffline(logURL: BaselineSampler.defaultLogURL, requireExists: false)
+                } else {
+                    report = BaselineSampler.harvestOffline(logURL: try localPath(harvest), requireExists: true)
+                }
+            } else {
+                guard let text = session, let seconds = Int(text), (1...3600).contains(seconds) else { throw usage() }
+                report = try await BaselineSampler.runSession(
+                    seconds: seconds, storageRoot: root,
+                    logURL: BaselineSampler.defaultLogURL,
+                    rotatedLogURL: BaselineSampler.defaultRotatedLogURL,
+                    target: .retraceApp
+                )
+            }
+        } catch {
+            let failure = error as? CLIError ?? CLIError("baseline_unavailable", "Baseline sampling could not be completed.", exitCode: 3)
+            report = BaselineReport.summarizing(mode: "unknown", metrics: HarvestedLogMetrics())
+            report.status = "failed"
+            report.exitCode = failure.exitCode
+            report.error = failure
+        }
+        report.elapsedMs = max(0, (ProcessInfo.processInfo.systemUptime - started) * 1000)
+        if let metrics {
+            do {
+                try metrics.record(command: "baseline", outcome: report.status == "complete" ? "succeeded" : report.status,
+                                   durationMs: report.elapsedMs, errorCode: report.error?.code)
+            } catch {
+                report.status = "failed"
+                report.exitCode = 5
+                report.error = CLIError("metrics_unavailable", "Could not persist baseline outcome in independent CLI state.", exitCode: 5)
+            }
+        }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            var bytes = try encoder.encode(report)
+            bytes.append(0x0A)
+            return CLIResult(stdout: bytes, stderr: report.error.map { "retrace-cli: \($0.code): \($0.message)\n" } ?? "", exitCode: report.exitCode)
+        } catch {
+            return CLIResult(stdout: Data("{\"schemaVersion\":1,\"status\":\"failed\",\"exitCode\":5,\"error\":{\"code\":\"output_failed\"}}\n".utf8),
+                             stderr: "retrace-cli: output_failed: JSON encoding failed.\n", exitCode: 5)
+        }
     }
 
     private static func execute(arguments: [String]) -> CLIResult {
@@ -504,7 +572,8 @@ enum CLICommand {
     }
 
     static func parseOptions(_ arguments: [String], export: Bool = false, sync: Bool = false,
-                             snapshotCommand: String? = nil, purgeCommand: String? = nil, keyCommand: String? = nil) throws -> [String: String] {
+                             snapshotCommand: String? = nil, purgeCommand: String? = nil, keyCommand: String? = nil,
+                             baselineCommand: Bool = false) throws -> [String: String] {
         var allowed = ["--storage-root", "--state-root"]
         if export { allowed += ["--day", "--limit"] }
         if sync { allowed.append("--snapshot-current") }
@@ -512,10 +581,22 @@ enum CLICommand {
         if snapshotCommand == "restore" { allowed.append("--to") }
         if purgeCommand == "sync-plan" { allowed.append("--purge-day") }
         if purgeCommand == "purge-apply" { allowed.append("--day") }
+        if baselineCommand { allowed.append("--session") }
         var values: [String: String] = [:]
         var index = 0
         while index < arguments.count {
             let option = arguments[index]
+            // --harvest-log may stand alone (default log) or take an explicit path.
+            if baselineCommand, option == "--harvest-log", values[option] == nil {
+                if index + 1 < arguments.count, !arguments[index + 1].hasPrefix("--") {
+                    values[option] = arguments[index + 1]
+                    index += 2
+                } else {
+                    values[option] = "true"
+                    index += 1
+                }
+                continue
+            }
             let flag = (sync && ["--dry-run", "--apply", "--phrase-from-stdin"].contains(option))
                 || (snapshotCommand == "snapshot" && option == "--encrypt")
                 || ((snapshotCommand != nil || keyCommand == "unwrap") && option == "--phrase-from-stdin")
