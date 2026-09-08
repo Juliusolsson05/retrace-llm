@@ -342,6 +342,82 @@ final class DBStorageSnapshotEstimateTests: XCTestCase {
 }
 
 final class DataAdapterRewindBoundaryTests: XCTestCase {
+    func testEvidenceReadDayIDsMatchAdapterFilteredRangeInOrder() async throws {
+        let day = makeCutoffDate().addingTimeInterval(2 * 86400)
+        let nextDay = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: 1, to: day))
+        let fixture = try await makeFixture(cutoffDate: makeCutoffDate())
+        do {
+            let later = try await seedFrame(in: fixture.retraceDatabase, timestamp: day.addingTimeInterval(200),
+                                            bundleID: "com.example.Later", text: "later", source: .native)
+            let first = try await seedFrame(in: fixture.retraceDatabase, timestamp: day,
+                                            bundleID: "com.example.First", text: "first", source: .native)
+            let hidden = try await seedFrameRecord(in: fixture.retraceDatabase, timestamp: day.addingTimeInterval(100),
+                                                   bundleID: "com.example.Hidden", text: "hidden", source: .native)
+            let deleted = try await seedFrame(in: fixture.retraceDatabase, timestamp: day.addingTimeInterval(150),
+                                              bundleID: "com.example.Deleted", text: "deleted", source: .native)
+            let atEnd = try await seedFrame(in: fixture.retraceDatabase, timestamp: nextDay,
+                                            bundleID: "com.example.NextDay", text: "end", source: .native)
+            let pointer = await fixture.retraceDatabase.getConnection()
+            let connection = SQLiteConnection(db: try XCTUnwrap(pointer))
+            try connection.execute(sql: """
+                INSERT INTO segment_tag (segmentId, tagId)
+                SELECT \(hidden.segmentID), id FROM tag WHERE name = 'hidden';
+                UPDATE frame SET rewritePurpose = 'deletion' WHERE id = \(deleted.value);
+                INSERT INTO frame (id, createdAt, imageFileName, segmentId, processingStatus)
+                VALUES (500, \(Int64(day.addingTimeInterval(250).timeIntervalSince1970 * 1000)), '', NULL, 2);
+                """)
+            let config = DatabaseConfig(dateFormatter: nil, storageRoot: "/tmp", source: .native,
+                                        cutoffDate: nil, minimumDate: makeCutoffDate())
+            let ids = try EvidenceReadQueries.visibleFrameIDs(connection: connection, config: config, day: day)
+            // DataAdapter's existing range end is inclusive; the day API's end is exclusive.
+            let frames = try await fixture.adapter.getFrames(from: day, to: nextDay.addingTimeInterval(-0.001),
+                                                             limit: 100, filters: FilterCriteria())
+            XCTAssertEqual(ids, [first.value, later.value])
+            XCTAssertEqual(frames.map(\.id.value), ids)
+
+            // Pin the legacy nil-filter behavior, including hidden segments and the inclusive end.
+            let unfiltered = try await fixture.adapter.getFrames(from: day, to: nextDay, limit: 100)
+            XCTAssertEqual(unfiltered.map(\.id.value), [first.value, hidden.frameID.value, later.value, 500, atEnd.value])
+            XCTAssertEqual(unfiltered.first?.metadata.appName, "First")
+            XCTAssertEqual(unfiltered.first?.metadata.windowName, "Window")
+
+            let dates = try await fixture.adapter.getDistinctDates()
+            let readDates = try EvidenceReadQueries.distinctDates(connection: connection, config: config)
+                .map { Calendar.current.startOfDay(for: $0) }
+            XCTAssertEqual(dates, [nextDay, day])
+            XCTAssertEqual(dates, readDates)
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
+    func testEvidenceReadPreservesLegacyInclusiveRangeAtRewindHandoff() async throws {
+        let cutoff = makeCutoffDate().addingTimeInterval(3600)
+        let fixture = try await makeFixture(cutoffDate: cutoff)
+        do {
+            let before = try await seedFrame(in: fixture.rewindDatabase, timestamp: cutoff.addingTimeInterval(-1),
+                                             bundleID: "com.example.Rewind", text: "before", source: .rewind)
+            let atCutoff = try await seedFrame(in: fixture.rewindDatabase, timestamp: cutoff,
+                                               bundleID: "com.example.Rewind", text: "at", source: .rewind)
+            let pointer = await fixture.rewindDatabase.getConnection()
+            let connection = SQLiteConnection(db: try XCTUnwrap(pointer))
+            let config = DatabaseConfig(dateFormatter: nil, storageRoot: "/tmp", source: .rewind, cutoffDate: cutoff)
+            let dayIDs = try EvidenceReadQueries.visibleFrameIDs(connection: connection, config: config, day: cutoff)
+            XCTAssertEqual(dayIDs, [before.value])
+            for filters in [nil, FilterCriteria()] {
+                let frames = try await fixture.adapter.getFrames(from: cutoff.addingTimeInterval(-60), to: cutoff,
+                                                                 limit: 10, filters: filters)
+                XCTAssertEqual(frames.map(\.id.value), [before.value, atCutoff.value])
+            }
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
     private final class BrokenDatabaseConnection: DatabaseConnection, @unchecked Sendable {
         func getConnection() -> OpaquePointer? {
             nil

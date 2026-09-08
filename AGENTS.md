@@ -112,7 +112,9 @@ retrace/
 │   ├── Schema.swift             # Current schema definition
 │   ├── Migrations/              # Schema migration scripts
 │   ├── Queries/                 # Query implementations
+│   │   └── EvidenceReadQueries.swift # SELECT-only day evidence and shared DataAdapter read semantics
 │   └── Tests/
+│       └── EvidenceReadQueriesTests.swift # Migrated SQLite visibility/date/read-only fixtures
 │
 ├── Storage/                     # File I/O, HEVC encoding
 │   ├── AGENTS.md
@@ -168,7 +170,7 @@ retrace/
 │   ├── RetentionManager.swift   # Data retention policies
 │   └── Tests/
 │       ├── FeedbackRecentMetricSupportTests.swift # Feedback-export metric sanitization coverage
-│       ├── InPageURLCaptureRoutingTests.swift
+│       ├── InPageURLCaptureRoutingTests.swift # URL routing, source boundaries, and evidence-read equivalence
 │       ├── MasterKeyManagerTests.swift
 │       ├── RetentionManagerTests.swift # Retention OCR cleanup, exclusions, and bounded transaction coverage
 │       ├── ServiceContainerRewindCutoffTests.swift # Rewind cutoff defaults and latest-frame probe coverage

@@ -10,6 +10,7 @@ You are responsible for the **Database** module of Retrace. Your job is to imple
 Database/
 ├── DatabaseManager.swift      # Main DatabaseProtocol implementation
 ├── DatabaseConnection.swift   # SQLite/SQLCipher connection wrappers + shared errors
+├── DatabaseConfig.swift       # Native millisecond/Rewind text dates and source bounds
 ├── ReadConnectionSupport.swift # Read-only connection factory, pool, and in-memory shared-connection bridge
 ├── FTSManager.swift           # FTSProtocol implementation
 ├── Schema.swift               # Table definitions
@@ -35,6 +36,7 @@ Database/
 │   ├── V18_DailyMetricsRecencyIndex.swift
 │   └── V19_FrameEncodedAt.swift
 ├── Queries/
+│   ├── EvidenceReadQueries.swift # SELECT-only day IDs, hidden-tag lookup, shared DataAdapter reads
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations
 │   └── DocumentQueries.swift  # Document/FTS operations
@@ -42,6 +44,7 @@ Database/
     ├── AsyncQueuePipelineTests.swift
     ├── DatabaseManagerTests.swift
     ├── EdgeCaseTests.swift
+    ├── EvidenceReadQueriesTests.swift # Migrated SQLite visibility, day/source bounds, read-only safety
     ├── FTSManagerTests.swift
     ├── IntegrationTests.swift
     ├── OCRPipelineTests.swift

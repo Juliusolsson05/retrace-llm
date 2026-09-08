@@ -284,24 +284,7 @@ public actor DataAdapter {
         config: DatabaseConfig,
         columnName: String
     ) -> (clause: String?, bindValues: [Date]) {
-        var clauses: [String] = []
-        var bindValues: [Date] = []
-
-        if let minimumDate = config.minimumDate {
-            clauses.append("\(columnName) >= ?")
-            bindValues.append(minimumDate)
-        }
-
-        if let cutoffDate = config.cutoffDate {
-            clauses.append("\(columnName) < ?")
-            bindValues.append(cutoffDate)
-        }
-
-        guard !clauses.isEmpty else {
-            return (nil, [])
-        }
-
-        return ("(" + clauses.joined(separator: " AND ") + ")", bindValues)
+        EvidenceReadQueries.buildSourceBoundaryClause(config: config, columnName: columnName)
     }
 
     private static func buildSegmentOverlapBoundaryClause(
@@ -364,8 +347,7 @@ public actor DataAdapter {
                     to: effectiveEnd,
                     limit: limit,
                     connection: connection,
-                    config: config,
-                    filters: nil
+                    config: config
                 )
             }
             allFrames.append(contentsOf: frames)
@@ -384,8 +366,7 @@ public actor DataAdapter {
                     to: endDate,
                     limit: limit,
                     connection: connection,
-                    config: config,
-                    filters: nil
+                    config: config
                 )
             }
             allFrames.append(contentsOf: frames)
@@ -1574,65 +1555,17 @@ public actor DataAdapter {
 
     // MARK: - Private SQL Query Methods
 
-    private struct FrameWithVideoProjection {
-        let encodedAtColumn: String
-        let processingStatusColumn: String
-        let redactionReasonColumn: String
-        let captureTriggerColumn: String
-        let mousePositionColumn: String
-        let scrollPositionColumn: String
-        let videoCurrentTimeColumn: String
-    }
+    private typealias FrameWithVideoProjection = EvidenceReadQueries.FrameWithVideoProjection
 
     private static func frameWithVideoProjection(
         source: FrameSource,
         tableAlias: String
     ) -> FrameWithVideoProjection {
-        if source == .rewind {
-            return FrameWithVideoProjection(
-                encodedAtColumn: "NULL as encodedAt",
-                processingStatusColumn: "-1 as processingStatus",
-                redactionReasonColumn: "NULL as redactionReason",
-                captureTriggerColumn: "NULL as captureTrigger",
-                mousePositionColumn: "NULL",
-                scrollPositionColumn: "NULL",
-                videoCurrentTimeColumn: "NULL"
-            )
-        }
-
-        return FrameWithVideoProjection(
-            encodedAtColumn: "\(tableAlias).encodedAt",
-            processingStatusColumn: "\(tableAlias).processingStatus",
-            redactionReasonColumn: "\(tableAlias).redactionReason",
-            captureTriggerColumn: "\(tableAlias).capture_trigger",
-            mousePositionColumn: "\(tableAlias).mousePosition",
-            scrollPositionColumn: "\(tableAlias).scrollPosition",
-            videoCurrentTimeColumn: "\(tableAlias).videoCurrentTime"
-        )
+        EvidenceReadQueries.frameWithVideoProjection(source: source, tableAlias: tableAlias)
     }
 
     private static func frameWithVideoSubqueryProjection(source: FrameSource) -> FrameWithVideoProjection {
-        if source == .rewind {
-            return FrameWithVideoProjection(
-                encodedAtColumn: "NULL as encodedAt",
-                processingStatusColumn: "-1 as processingStatus",
-                redactionReasonColumn: "NULL as redactionReason",
-                captureTriggerColumn: "NULL as captureTrigger",
-                mousePositionColumn: "NULL as mousePosition",
-                scrollPositionColumn: "NULL as scrollPosition",
-                videoCurrentTimeColumn: "NULL as videoCurrentTime"
-            )
-        }
-
-        return FrameWithVideoProjection(
-            encodedAtColumn: "encodedAt",
-            processingStatusColumn: "processingStatus",
-            redactionReasonColumn: "redactionReason",
-            captureTriggerColumn: "capture_trigger",
-            mousePositionColumn: "mousePosition",
-            scrollPositionColumn: "scrollPosition",
-            videoCurrentTimeColumn: "videoCurrentTime"
-        )
+        EvidenceReadQueries.frameWithVideoSubqueryProjection(source: source)
     }
 
     private static func videoInfoProjection(
@@ -1640,15 +1573,7 @@ public actor DataAdapter {
         frameAlias: String,
         videoAlias: String
     ) -> String {
-        if source == .rewind {
-            return "\(videoAlias).path, \(videoAlias).frameRate, \(videoAlias).width, \(videoAlias).height, 0 as videoProcessingState, NULL as videoFileSize, NULL as videoFrameCount, NULL as videoReencodedAt"
-        }
-
-        return """
-            \(videoAlias).path, \(videoAlias).frameRate, \(videoAlias).width, \(videoAlias).height,
-            \(videoAlias).processingState as videoProcessingState, \(videoAlias).fileSize as videoFileSize, \(videoAlias).frameCount as videoFrameCount,
-            (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = \(frameAlias).videoId) as videoReencodedAt
-            """
+        EvidenceReadQueries.videoInfoProjection(source: source, frameAlias: frameAlias, videoAlias: videoAlias)
     }
 
     private static func queryFramesWithVideoInfo(
@@ -1656,103 +1581,11 @@ public actor DataAdapter {
         to endDate: Date,
         limit: Int,
         connection: DatabaseConnection,
-        config: DatabaseConfig,
-        filters: FilterCriteria? = nil
+        config: DatabaseConfig
     ) throws -> [FrameWithVideoInfo] {
-        let effectiveStartDate = config.applyLowerBound(to: startDate)
-        let effectiveEndDate = config.applyCutoff(to: endDate)
-        guard effectiveStartDate < effectiveEndDate else { return [] }
-
-        // Build WHERE clause based on filters
-        var whereClauses = ["f.createdAt >= ?", "f.createdAt <= ?"]
-        if let visibilityClause = Self.nativeVisibleFrameClause(
-            frameAlias: "f",
-            isRewindDatabase: config.source == .rewind
-        ) {
-            whereClauses.append(visibilityClause)
-        }
-        var bindIndex = 3 // 1 and 2 are for timestamps
-
-        // App filter (include or exclude mode)
-        if let apps = filters?.selectedApps, !apps.isEmpty {
-            let filterMode = filters?.appFilterMode ?? .include
-            whereClauses.append(Self.buildAppFilterClause(apps: apps, mode: filterMode))
-        }
-
-        // Tag filter - need to join with segment_tag
-        let needsTagJoin = filters?.selectedTags != nil && !(filters?.selectedTags!.isEmpty ?? true)
-        let tagJoin = needsTagJoin ? """
-            INNER JOIN segment_tag st ON f.segmentId = st.segmentId
-            """ : ""
-
-        if let tags = filters?.selectedTags, !tags.isEmpty {
-            let placeholders = tags.map { _ in "?" }.joined(separator: ", ")
-            whereClauses.append("st.tagId IN (\(placeholders))")
-        }
-
-        let whereClause = whereClauses.joined(separator: " AND ")
-
-        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
-
-        let sql = """
-            SELECT
-                f.id,
-                f.createdAt,
-                f.segmentId,
-                f.videoId,
-                f.videoFrameIndex,
-                \(projection.encodedAtColumn),
-                \(projection.processingStatusColumn),
-                \(projection.redactionReasonColumn),
-                \(projection.captureTriggerColumn),
-                s.bundleID,
-                s.windowName,
-                s.browserUrl,
-                \(projection.mousePositionColumn),
-                \(projection.scrollPositionColumn),
-                \(projection.videoCurrentTimeColumn),
-                \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
-            FROM frame f
-            LEFT JOIN segment s ON f.segmentId = s.id
-            \(tagJoin)
-            LEFT JOIN video v ON f.videoId = v.id
-            WHERE \(whereClause)
-            ORDER BY f.createdAt ASC
-            LIMIT ?;
-            """
-
-        guard let statement = try? connection.prepare(sql: sql) else { return [] }
-        defer { connection.finalize(statement) }
-
-        config.bindDate(effectiveStartDate, to: statement, at: 1)
-        config.bindDate(effectiveEndDate, to: statement, at: 2)
-
-        // Bind app bundle IDs
-        if let apps = filters?.selectedApps, !apps.isEmpty {
-            for (index, app) in apps.enumerated() {
-                sqlite3_bind_text(statement, Int32(bindIndex + index), (app as NSString).utf8String, -1, nil)
-            }
-            bindIndex += apps.count
-        }
-
-        // Bind tag IDs
-        if let tags = filters?.selectedTags, !tags.isEmpty {
-            for (index, tagId) in tags.enumerated() {
-                sqlite3_bind_int64(statement, Int32(bindIndex + index), tagId)
-            }
-            bindIndex += tags.count
-        }
-
-        sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
-
-        var frames: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
-                frames.append(frameWithVideo)
-            }
-        }
-
-        return frames
+        try EvidenceReadQueries.timelineFramesInRange(
+            from: startDate, to: endDate, limit: limit, connection: connection, config: config
+        )
     }
 
     /// Fast unfiltered query - uses subquery to limit before join
@@ -2253,6 +2086,13 @@ public actor DataAdapter {
         hiddenTagId: Int64?,
         isRewindDatabase: Bool = false
     ) throws -> [FrameWithVideoInfo] {
+        if !filters.hasActiveFilters {
+            return try EvidenceReadQueries.timelineFramesInRange(
+                from: startDate, to: endDate, limit: limit, connection: connection, config: config,
+                hiddenTagID: isRewindDatabase ? nil : hiddenTagId, requireSegment: true
+            )
+        }
+
         let effectiveStartDate = config.applyLowerBound(to: startDate)
         let effectiveEndDate = config.applyCutoff(to: endDate)
         guard effectiveStartDate < effectiveEndDate else { return [] }
@@ -4605,9 +4445,7 @@ public actor DataAdapter {
         frameAlias: String? = "f",
         isRewindDatabase: Bool
     ) -> String? {
-        guard !isRewindDatabase else { return nil }
-        let prefix = frameAlias.map { "\($0)." } ?? ""
-        return "(\(prefix)rewritePurpose IS NULL OR \(prefix)rewritePurpose != 'deletion')"
+        EvidenceReadQueries.nativeVisibleFrameClause(frameAlias: frameAlias, isRewindDatabase: isRewindDatabase)
     }
 
     private struct FrameFilterQueryComponents {
@@ -4883,84 +4721,10 @@ public actor DataAdapter {
     // MARK: - Row Parsing
 
     private static func parseFrameWithVideoInfo(statement: OpaquePointer, config: DatabaseConfig) throws -> FrameWithVideoInfo {
-        let id = FrameID(value: sqlite3_column_int64(statement, 0))
-
-        guard let timestamp = config.parseDate(from: statement, column: 1) else {
+        guard let frame = EvidenceReadQueries.parseFrameWithVideoInfo(statement: statement, config: config) else {
             throw DataAdapterError.parseFailed
         }
-
-        let segmentID = AppSegmentID(value: sqlite3_column_int64(statement, 2))
-        let videoID = VideoSegmentID(value: sqlite3_column_int64(statement, 3))
-        let videoFrameIndex = Int(sqlite3_column_int(statement, 4))
-
-        let encodedAt = config.parseDate(from: statement, column: 5)
-        let processingStatus = Int(sqlite3_column_int(statement, 6))
-
-        let redactionReason = Self.getTextOrNil(statement, 7)
-        let captureTrigger = Self.getTextOrNil(statement, 8).flatMap(FrameCaptureTrigger.init(rawValue:))
-        let bundleID = Self.getTextOrNil(statement, 9) ?? ""
-        let windowName = Self.getTextOrNil(statement, 10)
-        let browserUrl = Self.getTextOrNil(statement, 11)
-        let mousePosition = Self.decodeStoredPoint(Self.getTextOrNil(statement, 12))
-        let scrollY = Self.decodeStoredPoint(Self.getTextOrNil(statement, 13))?.y
-        let videoCurrentTime = sqlite3_column_type(statement, 14) != SQLITE_NULL ? sqlite3_column_double(statement, 14) : nil
-
-        let videoPath = Self.getTextOrNil(statement, 15)
-        let frameRate = sqlite3_column_type(statement, 16) != SQLITE_NULL ? sqlite3_column_double(statement, 16) : nil
-        let width = sqlite3_column_type(statement, 17) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 17)) : nil
-        let height = sqlite3_column_type(statement, 18) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 18)) : nil
-        let videoProcessingState = sqlite3_column_type(statement, 19) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 19)) : 0
-        let fileSizeBytes = sqlite3_column_type(statement, 20) != SQLITE_NULL ? sqlite3_column_int64(statement, 20) : nil
-        let frameCount = sqlite3_column_type(statement, 21) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 21)) : nil
-        let videoReencodedAt = config.parseDate(from: statement, column: 22)
-
-        let metadata = FrameMetadata(
-            appBundleID: bundleID.isEmpty ? nil : bundleID,
-            appName: bundleID.components(separatedBy: ".").last,
-            windowName: windowName,
-            browserURL: browserUrl,
-            redactionReason: redactionReason,
-            captureTrigger: captureTrigger,
-            displayID: 0,
-            mousePosition: mousePosition.map { CGPoint(x: $0.x, y: $0.y) }
-        )
-
-        let frame = FrameReference(
-            id: id,
-            timestamp: timestamp,
-            segmentID: segmentID,
-            videoID: videoID,
-            frameIndexInSegment: videoFrameIndex,
-            encodedAt: encodedAt,
-            metadata: metadata,
-            source: config.source
-        )
-
-        let videoInfo: FrameVideoInfo?
-        if let relativePath = videoPath, let rate = frameRate, let w = width, let h = height {
-            let fullPath = "\(config.storageRoot)/\(relativePath)"
-            videoInfo = FrameVideoInfo(
-                videoPath: fullPath,
-                frameIndex: videoFrameIndex,
-                frameRate: rate,
-                width: w,
-                height: h,
-                isVideoFinalized: videoProcessingState == 0,
-                videoReencodedAt: videoReencodedAt,
-                fileSizeBytes: fileSizeBytes,
-                frameCount: frameCount
-            )
-        } else {
-            videoInfo = nil
-        }
-
-        return FrameWithVideoInfo(
-            frame: frame,
-            videoInfo: videoInfo,
-            processingStatus: processingStatus,
-            videoCurrentTime: videoCurrentTime,
-            scrollY: scrollY
-        )
+        return frame
     }
 
     private static func parseVisibleBlockBoundaryHit(
@@ -5120,56 +4884,7 @@ public actor DataAdapter {
 
     /// Query distinct dates from a specific connection
     private static func queryDistinctDates(connection: DatabaseConnection, config: DatabaseConfig) throws -> [Date] {
-        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "createdAt")
-        var whereClauses: [String] = []
-        if let visibilityClause = Self.nativeVisibleFrameClause(
-            frameAlias: nil,
-            isRewindDatabase: config.source == .rewind
-        ) {
-            whereClauses.append(visibilityClause)
-        }
-        if let boundaryClause = sourceBoundaryFilter.clause {
-            whereClauses.append(boundaryClause)
-        }
-        let whereClause = whereClauses.isEmpty ? "" : "WHERE " + whereClauses.joined(separator: " AND ")
-
-        let sql: String
-        if config.dateFormatter == nil {
-            sql = """
-                SELECT MIN(createdAt) as dayTimestamp
-                FROM frame
-                \(whereClause)
-                GROUP BY date(createdAt / 1000, 'unixepoch', 'localtime')
-                ORDER BY dayTimestamp DESC
-                """
-        } else {
-            sql = """
-                SELECT MIN(createdAt) as dayTimestamp
-                FROM frame
-                \(whereClause)
-                GROUP BY date(createdAt, 'localtime')
-                ORDER BY dayTimestamp DESC
-                """
-        }
-
-        guard let statement = try? connection.prepare(sql: sql) else {
-            return []
-        }
-        defer { connection.finalize(statement) }
-
-        var bindIndex = 1
-        for date in sourceBoundaryFilter.bindValues {
-            config.bindDate(date, to: statement, at: Int32(bindIndex))
-            bindIndex += 1
-        }
-
-        var dates: [Date] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            guard let date = config.parseDate(from: statement, column: 0) else { continue }
-            dates.append(date)
-        }
-
-        return dates
+        try EvidenceReadQueries.distinctDates(connection: connection, config: config)
     }
 
     private static func queryDistinctDatesWithFilters(
