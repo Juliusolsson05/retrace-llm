@@ -348,6 +348,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupGhostAppLoggingObservers()
         installMainMenuIfNeeded(force: true)
         applyDockIconVisibilityPreference()
+        // Request TCC prompts on every launch, not just first run: macOS only lists an
+        // app under Screen Recording after it attempts capture or explicitly requests
+        // access, so a completed-onboarding launch that never starts recording would
+        // otherwise leave the app missing from the permission list entirely.
+        requestPermissions()
         finishApplicationLaunch()
     }
 
