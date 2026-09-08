@@ -70,6 +70,362 @@ final class RetraceCLITests: XCTestCase {
         }
     }
 
+    private let exportDay = "2026-03-08"
+
+    private var exportStart: Date {
+        Calendar.current.date(from: DateComponents(year: 2026, month: 3, day: 8))!
+    }
+
+    private func initializeEvidence() async throws {
+        try await initialize()
+        let db = try openFixture()
+        defer { sqlite3_close(db) }
+        try exec(db, """
+            INSERT INTO video(id,height,width,path,frameRate,processingState)
+            VALUES(7,100,100,'fixture-video-path-must-not-be-exported',0.5,0);
+            INSERT INTO segment(id,bundleID,startDate,endDate,windowName,browserUrl,type)
+            VALUES(1,'com.example.Editor',0,0,'Fixture window','https://example.com',0),
+                  (2,'com.example.Hidden',0,0,'Hidden window',NULL,0),
+                  (3,'',0,0,NULL,NULL,0);
+            DELETE FROM tag;
+            INSERT INTO tag(id,name) VALUES(42,'hidden');
+            INSERT INTO segment_tag(segmentId,tagId) VALUES(2,42);
+            """)
+    }
+
+    private func insertEvidence(_ id: Int64, timestampMs: Int64, segmentID: Int64? = 1,
+                                status: Int = 2, rewrite: String? = nil) throws {
+        let db = try openFixture()
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_prepare_v2(db, """
+            INSERT INTO frame(id,createdAt,imageFileName,segmentId,videoId,videoFrameIndex,
+                              processingStatus,redactionReason,rewritePurpose)
+            VALUES(?,?,'fixture-frame-path-must-not-be-exported',?,7,12,?,'fixture-redaction',?)
+            """, -1, &statement, nil), SQLITE_OK)
+        _ = try XCTUnwrap(statement)
+        sqlite3_bind_int64(statement, 1, id)
+        sqlite3_bind_int64(statement, 2, timestampMs)
+        if let segmentID { sqlite3_bind_int64(statement, 3, segmentID) }
+        sqlite3_bind_int(statement, 4, Int32(status))
+        if let rewrite {
+            sqlite3_bind_text(statement, 5, rewrite, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE, String(cString: sqlite3_errmsg(db)))
+    }
+
+    private var exportStartMs: Int64 { Int64(exportStart.timeIntervalSince1970 * 1000) }
+
+    private func exportFrames(_ result: CLIResult) throws -> [[String: Any]] {
+        if !result.stdout.isEmpty { XCTAssertEqual(result.stdout.last, 0x0A) }
+        return try result.stdout.split(separator: 0x0A).map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0)) as? [String: Any])
+        }
+    }
+
+    private func exportSummary(_ result: CLIResult) throws -> [String: Any] {
+        XCTAssertEqual(result.stderr.split(separator: "\n").count, 1, result.stderr)
+        let summary = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(result.stderr.utf8)) as? [String: Any])
+        XCTAssertEqual(summary["schemaVersion"] as? Int, 1)
+        XCTAssertEqual(summary["command"] as? String, "export")
+        XCTAssertEqual(summary["exitCode"] as? Int32, result.exitCode)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(summary["elapsedMs"] as? Double), 0)
+        return summary
+    }
+
+    func testExportLocalDayWindowAndTimestampThenIDOrder() async throws {
+        try await initializeEvidence()
+        let end = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: 1, to: exportStart))
+        let endMs = Int64(end.timeIntervalSince1970 * 1000)
+        for (id, timestamp) in [(Int64(1), exportStartMs - 1), (4, exportStartMs),
+                                (3, exportStartMs), (2, endMs - 1), (5, endMs)] {
+            try insertEvidence(id, timestampMs: timestamp)
+        }
+        let before = try Data(contentsOf: database)
+        let result = await run("export", extra: ["--day", exportDay])
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(try exportFrames(result).compactMap { $0["frameId"] as? Int64 }, [3, 4, 2])
+        let summary = try exportSummary(result)
+        XCTAssertEqual(summary["day"] as? String, exportDay)
+        XCTAssertEqual(summary["frameCount"] as? Int, 3)
+        XCTAssertEqual(summary["videoCount"] as? Int, 1)
+        XCTAssertEqual(summary["segmentCount"] as? Int, 1)
+        XCTAssertEqual(summary["limitApplied"] as? Int, 5000)
+        XCTAssertEqual(summary["truncated"] as? Bool, false)
+        XCTAssertEqual(try Data(contentsOf: database), before)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["retrace.db"])
+    }
+
+    func testExportHiddenSegmentsMatchStrictEvidenceDayRead() async throws {
+        try await initializeEvidence()
+        try insertEvidence(1, timestampMs: exportStartMs)
+        try insertEvidence(2, timestampMs: exportStartMs + 1, segmentID: 2)
+        try insertEvidence(3, timestampMs: exportStartMs + 2, segmentID: nil)
+        let expected = try SourceDatabase.withConnection(root: root) {
+            try EvidenceReadQueries.visibleFrameIDs(connection: $0, config: .retrace(storageRoot: root.path), day: exportStart)
+        }
+        XCTAssertEqual(expected, [1])
+        let result = await run("export", extra: ["--day", exportDay])
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(try exportFrames(result).compactMap { $0["frameId"] as? Int64 }, expected)
+    }
+
+    func testExportExcludesDeletionRewritesAcrossStatusesAndKeepsRedactions() async throws {
+        try await initializeEvidence()
+        for status in 0...4 {
+            try insertEvidence(Int64(status + 1), timestampMs: exportStartMs + Int64(status), status: status,
+                               rewrite: status == 4 ? "redaction" : nil)
+            try insertEvidence(Int64(status + 11), timestampMs: exportStartMs + Int64(status), status: status,
+                               rewrite: "deletion")
+        }
+        let result = await run("export", extra: ["--day", exportDay])
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(try exportFrames(result).compactMap { $0["frameId"] as? Int }, [1, 2, 3, 4, 5])
+    }
+
+    func testExportJSONLMetadataShapeEscapingAndExplicitNulls() async throws {
+        try await initializeEvidence()
+        try insertEvidence(1, timestampMs: exportStartMs)
+        try insertEvidence(2, timestampMs: exportStartMs + 1, segmentID: 3)
+        let db = try openFixture()
+        try exec(db, """
+            UPDATE segment SET windowName = 'First' || char(10) || '"Quoted" Ω' WHERE id = 1;
+            UPDATE frame SET videoId = NULL, videoFrameIndex = NULL WHERE id = 2;
+            """)
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let result = await run("export", extra: ["--day", exportDay])
+        XCTAssertEqual(result.exitCode, 0)
+        let frames = try exportFrames(result)
+        XCTAssertEqual(frames.count, 2)
+        let keys: Set<String> = ["schemaVersion", "frameId", "timestampMs", "videoId", "videoFrameIndex",
+                                 "segmentId", "appBundleId", "appName", "windowName", "browserUrl"]
+        for frame in frames {
+            XCTAssertEqual(Set(frame.keys), keys)
+            XCTAssertEqual(frame["schemaVersion"] as? Int, 1)
+            XCTAssertNotNil(frame["frameId"] as? Int64)
+            XCTAssertNotNil(frame["timestampMs"] as? Int64)
+            XCTAssertNotNil(frame["segmentId"] as? Int64)
+        }
+        let populated = try XCTUnwrap(frames.first)
+        XCTAssertEqual(populated["timestampMs"] as? Int64, exportStartMs)
+        XCTAssertEqual(populated["videoId"] as? Int, 7)
+        XCTAssertEqual(populated["videoFrameIndex"] as? Int, 12)
+        XCTAssertEqual(populated["segmentId"] as? Int, 1)
+        XCTAssertEqual(populated["appBundleId"] as? String, "com.example.Editor")
+        // Native segment rows store a bundle ID, not a display name; match DataAdapter's fallback.
+        XCTAssertEqual(populated["appName"] as? String, "Editor")
+        XCTAssertEqual(populated["windowName"] as? String, "First\n\"Quoted\" Ω")
+        XCTAssertEqual(populated["browserUrl"] as? String, "https://example.com")
+        let absent = try XCTUnwrap(frames.last)
+        for key in ["appBundleId", "appName", "windowName", "browserUrl", "videoId", "videoFrameIndex"] {
+            XCTAssertTrue(absent[key] is NSNull, "Expected explicit null for \(key)")
+        }
+        XCTAssertFalse(String(decoding: result.stdout, as: UTF8.self).contains("must-not-be-exported"))
+        XCTAssertEqual(try exportSummary(result)["videoCount"] as? Int, 1)
+    }
+
+    func testExportLimitUsesVisibleLookaheadAndDoesNotTruncateExactLimit() async throws {
+        try await initializeEvidence()
+        try insertEvidence(1, timestampMs: exportStartMs)
+        try insertEvidence(2, timestampMs: exportStartMs + 1, segmentID: 2)
+        try insertEvidence(3, timestampMs: exportStartMs + 2, rewrite: "deletion")
+        let exact = await run("export", extra: ["--day", exportDay, "--limit", "1"])
+        XCTAssertEqual(exact.exitCode, 0)
+        XCTAssertEqual(try exportFrames(exact).compactMap { $0["frameId"] as? Int }, [1])
+        XCTAssertEqual(try exportSummary(exact)["truncated"] as? Bool, false)
+        try insertEvidence(4, timestampMs: exportStartMs + 3)
+        let limited = await run("export", extra: ["--day", exportDay, "--limit", "1"])
+        XCTAssertEqual(limited.exitCode, 0)
+        XCTAssertEqual(try exportFrames(limited).compactMap { $0["frameId"] as? Int }, [1])
+        let summary = try exportSummary(limited)
+        XCTAssertEqual(summary["frameCount"] as? Int, 1)
+        XCTAssertEqual(summary["limitApplied"] as? Int, 1)
+        XCTAssertEqual(summary["truncated"] as? Bool, true)
+    }
+
+    func testExportDefaultLimitAndMaximumOverride() async throws {
+        try await initializeEvidence()
+        let db = try openFixture()
+        try exec(db, """
+            WITH RECURSIVE ids(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM ids WHERE id < 5001)
+            INSERT INTO frame(id,createdAt,imageFileName,segmentId,videoId,videoFrameIndex)
+            SELECT id, \(exportStartMs) + id, '', 1, 7, id FROM ids;
+            """)
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let limited = await run("export", extra: ["--day", exportDay])
+        XCTAssertEqual(limited.exitCode, 0)
+        XCTAssertEqual(try exportFrames(limited).count, 5000)
+        XCTAssertEqual(try exportSummary(limited)["truncated"] as? Bool, true)
+        let maximum = await run("export", extra: ["--day", exportDay, "--limit", "50000"])
+        XCTAssertEqual(maximum.exitCode, 0)
+        XCTAssertEqual(try exportFrames(maximum).count, 5001)
+        XCTAssertEqual(try exportSummary(maximum)["truncated"] as? Bool, false)
+    }
+
+    func testExportEmptyDayAndValidLeapDaySucceed() async throws {
+        try await initialize()
+        for day in [exportDay, "2024-02-29"] {
+            let result = await run("export", extra: ["--day", day])
+            XCTAssertEqual(result.exitCode, 0)
+            XCTAssertTrue(result.stdout.isEmpty)
+            let summary = try exportSummary(result)
+            XCTAssertEqual(summary["day"] as? String, day)
+            for key in ["frameCount", "videoCount", "segmentCount"] { XCTAssertEqual(summary[key] as? Int, 0) }
+            XCTAssertEqual(summary["truncated"] as? Bool, false)
+        }
+    }
+
+    func testExportInvalidDaysLimitsAndFlagsAreUsageErrorsWithoutMetrics() async throws {
+        let invalidDays = ["", "2026-3-08", "2026-03-8", "2026-02-29", "2024-02-30", "2026-04-31",
+                           "2026-00-01", "2026-13-01", "2026-01-00", "0000-01-01", "26-03-08",
+                           "2026-03-08T00:00:00Z", "2026-03-08\n", " 2026-03-08", "２０２６-03-08"]
+        let invalidOptions = invalidDays.map { ["--day", $0] } + [
+            [], ["--day"], ["--day", exportDay, "--day", exportDay], ["--day", exportDay, "--unknown", "1"],
+            ["--day", exportDay, "--limit"], ["--day", exportDay, "--limit", "1", "--limit", "2"]
+        ] + ["0", "50001", "-1", "1.5", "many", "99999999999999999999"].map { ["--day", exportDay, "--limit", $0] }
+        for extra in invalidOptions {
+            let result = await run("export", extra: extra)
+            XCTAssertEqual(result.exitCode, 2, "Arguments: \(extra)")
+            XCTAssertTrue(result.stdout.isEmpty)
+            XCTAssertEqual((try exportSummary(result)["error"] as? [String: Any])?["code"] as? String, "usage")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+        for command in ["status", "baseline"] {
+            try assertError(await run(command, extra: ["--day", exportDay]), "usage")
+            try assertError(await run(command, extra: ["--limit", "1"]), "usage")
+        }
+        let help = try json(await CLICommand.run(arguments: ["help"]))
+        XCTAssertTrue(try XCTUnwrap(help["help"] as? [String]).contains { $0.contains("export --day YYYY-MM-DD") })
+    }
+
+    func testExportMetricsRecordOutcomeAndTruncationWithoutContent() async throws {
+        try await initializeEvidence()
+        try insertEvidence(1, timestampMs: exportStartMs)
+        try insertEvidence(2, timestampMs: exportStartMs + 1)
+        let result = await run("export", extra: ["--day", exportDay, "--limit", "1"])
+        XCTAssertEqual(result.exitCode, 0)
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(state.appendingPathComponent("metrics.db").path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT metricType, metadata FROM daily_metrics ORDER BY id", -1, &statement, nil), SQLITE_OK)
+        _ = try XCTUnwrap(statement)
+        for outcome in ["started", "succeeded"] {
+            XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+            let type = try XCTUnwrap(sqlite3_column_text(statement, 0))
+            XCTAssertEqual(String(cString: type), "cli_command")
+            let bytes = try XCTUnwrap(sqlite3_column_text(statement, 1))
+            let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(String(cString: bytes).utf8)) as? [String: Any])
+            XCTAssertEqual(metadata["command"] as? String, "export")
+            XCTAssertEqual(metadata["outcome"] as? String, outcome)
+            XCTAssertEqual(metadata["truncated"] as? Bool, outcome == "succeeded")
+            XCTAssertTrue(Set(metadata.keys).isSubset(of: ["command", "outcome", "durationMs", "errorCode", "truncated"]))
+        }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+    }
+
+    func testExportMissingVisibilitySchemaFailsWithoutFrameOutput() async throws {
+        try await initializeEvidence()
+        try insertEvidence(1, timestampMs: exportStartMs)
+        let db = try openFixture()
+        try exec(db, "DROP TABLE segment_tag; DROP TABLE tag;")
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let result = await run("export", extra: ["--day", exportDay])
+        XCTAssertEqual(result.exitCode, 3)
+        XCTAssertTrue(result.stdout.isEmpty)
+        XCTAssertEqual(try exportSummary(result)["status"] as? String, "failed")
+    }
+
+    func testExportStreamsToWriterAndRecordsFailedOutput() async throws {
+        try await initializeEvidence()
+        try insertEvidence(1, timestampMs: exportStartMs)
+        try insertEvidence(2, timestampMs: exportStartMs + 1)
+        let output = sandbox.appendingPathComponent("export.jsonl")
+        XCTAssertTrue(FileManager.default.createFile(atPath: output.path, contents: Data()))
+        let writer = try FileHandle(forWritingTo: output)
+        let arguments = ["export", "--day", exportDay, "--storage-root", root.path, "--state-root", state.path]
+        let succeeded = await CLICommand.run(arguments: arguments) { try writer.write(contentsOf: $0) }
+        try writer.close()
+        XCTAssertEqual(succeeded.exitCode, 0)
+        XCTAssertTrue(succeeded.stdout.isEmpty, "Streamed bytes must not be buffered for a second stdout write")
+        let bytes = try Data(contentsOf: output)
+        let frames = try exportFrames(CLIResult(stdout: bytes, stderr: succeeded.stderr, exitCode: 0))
+        XCTAssertEqual(frames.compactMap { $0["frameId"] as? Int }, [1, 2])
+        XCTAssertEqual(try exportSummary(succeeded)["frameCount"] as? Int, 2)
+
+        let failingWriter = try FileHandle(forWritingTo: output)
+        try failingWriter.truncate(atOffset: 0)
+        let failed = await CLICommand.run(arguments: arguments) { line in
+            let frame = try XCTUnwrap(JSONSerialization.jsonObject(with: line) as? [String: Any])
+            if frame["frameId"] as? Int == 2 { try failingWriter.close() }
+            try failingWriter.write(contentsOf: line)
+        }
+        XCTAssertEqual(failed.exitCode, 5)
+        XCTAssertTrue(failed.stdout.isEmpty)
+        let partial = try exportFrames(CLIResult(stdout: Data(contentsOf: output), stderr: failed.stderr, exitCode: 5))
+        XCTAssertEqual(partial.compactMap { $0["frameId"] as? Int }, [1])
+        let summary = try exportSummary(failed)
+        XCTAssertEqual(summary["frameCount"] as? Int, 1)
+        XCTAssertEqual(summary["truncated"] as? Bool, false)
+        XCTAssertEqual((summary["error"] as? [String: Any])?["code"] as? String, "output_failed")
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(state.appendingPathComponent("metrics.db").path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT metadata FROM daily_metrics ORDER BY id DESC LIMIT 1", -1, &statement, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        let text = try XCTUnwrap(sqlite3_column_text(statement, 0))
+        let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(String(cString: text).utf8)) as? [String: Any])
+        XCTAssertEqual(metadata["command"] as? String, "export")
+        XCTAssertEqual(metadata["outcome"] as? String, "failed")
+        XCTAssertEqual(metadata["errorCode"] as? String, "output_failed")
+        XCTAssertEqual(metadata["truncated"] as? Bool, false)
+    }
+
+    func testExportLiveWALAndMissingSidecarsNeverMutateSource() async throws {
+        try await initializeEvidence()
+        let writer = try openFixture()
+        try exec(writer, """
+            PRAGMA journal_mode=WAL;
+            INSERT INTO frame(id,createdAt,imageFileName,segmentId,videoId,videoFrameIndex)
+            VALUES(1,\(exportStartMs),'',1,7,0);
+            """)
+        let wal = URL(fileURLWithPath: database.path + "-wal")
+        let before = try Data(contentsOf: database)
+        let walBefore = try Data(contentsOf: wal)
+        let result = await run("export", extra: ["--day", exportDay])
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(try exportFrames(result).compactMap { $0["frameId"] as? Int }, [1])
+        XCTAssertEqual(try Data(contentsOf: database), before)
+        XCTAssertEqual(try Data(contentsOf: wal), walBefore)
+        XCTAssertEqual(sqlite3_close(writer), SQLITE_OK)
+
+        let checkpointed = try Data(contentsOf: database)
+        let unavailable = await run("export", extra: ["--day", exportDay])
+        XCTAssertEqual(unavailable.exitCode, 3)
+        XCTAssertTrue(unavailable.stdout.isEmpty)
+        XCTAssertEqual((try exportSummary(unavailable)["error"] as? [String: Any])?["code"] as? String, "database_unreadable")
+        XCTAssertEqual(try Data(contentsOf: database), checkpointed)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["retrace.db"])
+    }
+
+    func testExportMissingHiddenTagDoesNotCreateOne() async throws {
+        try await initializeEvidence()
+        try insertEvidence(1, timestampMs: exportStartMs)
+        let db = try openFixture()
+        try exec(db, "DELETE FROM segment_tag; DELETE FROM tag;")
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let before = try Data(contentsOf: database)
+        let result = await run("export", extra: ["--day", exportDay])
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(try exportFrames(result).compactMap { $0["frameId"] as? Int }, [1])
+        XCTAssertEqual(try Data(contentsOf: database), before)
+    }
+
     func testHelpAndUsageContractWithoutFilesystem() async throws {
         let help = await CLICommand.run(arguments: ["help"])
         XCTAssertEqual(help.exitCode, 0)

@@ -70,14 +70,17 @@ final class CLIStateMetrics {
 
     deinit { sqlite3_close_v2(db) }
 
-    func record(command: String, outcome: String, durationMs: Double? = nil, errorCode: String? = nil) throws {
+    func record(command: String, outcome: String, durationMs: Double? = nil, errorCode: String? = nil,
+                truncated: Bool? = nil) throws {
         struct Metadata: Encodable {
             let command: String
             let outcome: String
             let durationMs: Double?
             let errorCode: String?
+            let truncated: Bool?
         }
-        let metadata = try JSONEncoder().encode(Metadata(command: command, outcome: outcome, durationMs: durationMs, errorCode: errorCode))
+        let metadata = try JSONEncoder().encode(Metadata(command: command, outcome: outcome, durationMs: durationMs,
+                                                       errorCode: errorCode, truncated: truncated))
         let text = String(decoding: metadata, as: UTF8.self)
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }

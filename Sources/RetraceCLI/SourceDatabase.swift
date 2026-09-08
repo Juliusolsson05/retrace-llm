@@ -25,6 +25,40 @@ struct DatabaseSummary: Encodable, Sendable {
     }
 }
 
+/// Versioned JSONL wire record. Native rows can precede video assignment, so preserve
+/// missing video references as null instead of inventing a usable frame location.
+struct CLIExportFrame: Encodable, Sendable {
+    let frameId: Int64
+    let timestampMs: Int64
+    let videoId: Int64?
+    let videoFrameIndex: Int64?
+    let segmentId: Int64
+    let appBundleId: String?
+    let windowName: String?
+    let browserUrl: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, frameId, timestampMs, videoId, videoFrameIndex, segmentId
+        case appBundleId, appName, windowName, browserUrl
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(1, forKey: .schemaVersion)
+        try container.encode(frameId, forKey: .frameId)
+        try container.encode(timestampMs, forKey: .timestampMs)
+        try container.encode(videoId, forKey: .videoId)
+        try container.encode(videoFrameIndex, forKey: .videoFrameIndex)
+        try container.encode(segmentId, forKey: .segmentId)
+        try container.encode(appBundleId, forKey: .appBundleId)
+        // No display name is stored in segment; use DataAdapter's metadata fallback
+        // without consulting NSWorkspace, installed apps, or any other source.
+        try container.encode(appBundleId?.components(separatedBy: ".").last, forKey: .appName)
+        try container.encode(windowName, forKey: .windowName)
+        try container.encode(browserUrl, forKey: .browserUrl)
+    }
+}
+
 enum SourceDatabase {
     static func withConnection<T>(root: URL, _ body: (DatabaseConnection) throws -> T) throws -> T {
         var isDirectory: ObjCBool = false
@@ -122,6 +156,90 @@ enum SourceDatabase {
                                          lastFrameTimestampMs: sqlite3_column_type(stmt, 4) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 4))
             guard sqlite3_step(stmt) == SQLITE_DONE else { throw CLIError("database_query_failed", "Aggregate SELECT did not complete.") }
             return result
+        }
+    }
+
+    /// Streams at most limit rows and returns whether another visible row exists.
+    /// visibleFrameIDs is intentionally unbounded; reuse its visibility helpers and
+    /// strict day predicates here so the CLI never materializes an entire day's IDs.
+    static func exportFrames(
+        _ connection: DatabaseConnection,
+        config: DatabaseConfig,
+        day: Date,
+        limit: Int,
+        emit: (CLIExportFrame) throws -> Void
+    ) throws -> Bool {
+        let calendar = Calendar.current
+        let start = calendar.startOfDay(for: day)
+        guard let end = calendar.date(byAdding: .day, value: 1, to: start) else {
+            throw CLIError("database_query_failed", "Could not determine the next local midnight.")
+        }
+        // The hidden-tag lookup and frame SELECT must observe the same snapshot. This
+        // deferred read transaction does not create journals or reserve a writer lock.
+        try connection.beginTransaction()
+        defer { try? connection.rollback() }
+        let hiddenTagID = try EvidenceReadQueries.hiddenTagID(connection: connection)
+        let boundary = EvidenceReadQueries.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
+        var clauses = ["f.createdAt >= ?", "f.createdAt < ?"]
+        if let visibility = EvidenceReadQueries.nativeVisibleFrameClause(isRewindDatabase: false) {
+            clauses.append(visibility)
+        }
+        if let boundaryClause = boundary.clause { clauses.append(boundaryClause) }
+        if hiddenTagID != nil {
+            clauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_hidden
+                    WHERE st_hidden.segmentId = f.segmentId AND st_hidden.tagId = ?
+                )
+                """)
+        }
+        return try statement(connection, """
+            SELECT f.id, f.createdAt, f.videoId, f.videoFrameIndex, f.segmentId,
+                   NULLIF(s.bundleID, ''), s.windowName, s.browserUrl
+            FROM frame f
+            INNER JOIN segment s ON f.segmentId = s.id
+            WHERE \(clauses.joined(separator: " AND "))
+            ORDER BY f.createdAt ASC, f.id ASC
+            LIMIT ?
+            """) { stmt in
+            config.bindDate(start, to: stmt, at: 1)
+            config.bindDate(end, to: stmt, at: 2)
+            var index: Int32 = 3
+            for date in boundary.bindValues {
+                config.bindDate(date, to: stmt, at: index)
+                index += 1
+            }
+            if let hiddenTagID {
+                sqlite3_bind_int64(stmt, index, hiddenTagID)
+                index += 1
+            }
+            sqlite3_bind_int64(stmt, index, Int64(limit) + 1)
+            var count = 0
+            var result = sqlite3_step(stmt)
+            while result == SQLITE_ROW {
+                if count == limit { return true }
+                // SQLite affinity permits malformed values even in INTEGER columns.
+                // Preserve raw milliseconds and IDs; never silently coerce bad evidence.
+                guard [Int32(0), 1, 4].allSatisfy({ sqlite3_column_type(stmt, $0) == SQLITE_INTEGER }),
+                      [Int32(2), 3].allSatisfy({ [SQLITE_INTEGER, SQLITE_NULL].contains(sqlite3_column_type(stmt, $0)) }) else {
+                    throw CLIError("database_query_failed", "Frame evidence contains invalid native numeric metadata.")
+                }
+                func text(_ column: Int32) -> String? {
+                    guard let value = sqlite3_column_text(stmt, column) else { return nil }
+                    // Length-based decoding preserves embedded NULs in stored metadata.
+                    return String(decoding: UnsafeBufferPointer(start: value, count: Int(sqlite3_column_bytes(stmt, column))), as: UTF8.self)
+                }
+                try emit(CLIExportFrame(
+                    frameId: sqlite3_column_int64(stmt, 0), timestampMs: sqlite3_column_int64(stmt, 1),
+                    videoId: sqlite3_column_type(stmt, 2) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 2),
+                    videoFrameIndex: sqlite3_column_type(stmt, 3) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 3),
+                    segmentId: sqlite3_column_int64(stmt, 4), appBundleId: text(5), windowName: text(6), browserUrl: text(7)
+                ))
+                count += 1
+                result = sqlite3_step(stmt)
+            }
+            guard result == SQLITE_DONE else { throw CLIError("database_query_failed", "Frame evidence SELECT did not complete.") }
+            return false
         }
     }
 
