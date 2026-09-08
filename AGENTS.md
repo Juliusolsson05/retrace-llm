@@ -62,12 +62,13 @@ retrace/
 │   ├── RetraceCLI/              # Evidence, local sync planning and database recovery executable `retrace-cli`
 │   │   ├── RetraceCLI.swift     # Noninteractive entry point
 │   │   ├── CLICommand.swift     # JSON/JSONL contracts, metrics, evidence/sync/purge/snapshot/verify/restore routing
+│   │   ├── CLIKeyCommand.swift  # Explicit key init/status/rotate/unwrap, stdin recovery and secret-free metrics
 │   │   ├── SourceDatabase.swift # Native schema/aggregate/visible-day purge SELECTs, strict read-only source VFS
 │   │   ├── ChunkInventory.swift # Bounded descriptor-relative metadata inventory
 │   │   ├── CLIStateMetrics.swift # Independent CLI-owned daily_metrics SQLite store
 │   │   ├── B2Client.swift       # Disabled-by-default B2 Native API shell with injectable transport
 │   │   ├── SyncPlanner.swift    # Read-only chunk hashing/revision planning and pending-purge suppression; uploads disabled
-│   │   ├── SnapshotStore.swift  # SQLite online backup, lineage verification, and empty-target restore
+│   │   ├── SnapshotStore.swift  # SQLite online backup, optional RBC1 encryption, dual-hash lineage and empty-target restore
 │   │   └── Tests/RetraceCLITests.swift # Temporary SQLite/FileManager contract fixtures
 │   ├── TestMostRecentFrame/     # Existing diagnostic executable
 │   └── QueryRewindApps/         # Existing Rewind query executable
@@ -129,7 +130,9 @@ retrace/
 │   ├── VideoEncoder/            # HEVC video encoding
 │   ├── WAL/                     # Write-Ahead Log (WALManager, RecoveryManager)
 │   ├── CloudSync/
-│   │   └── SyncManifest.swift   # Transactional chunk revisions, deletion ledger and snapshot lineage in CLI state only
+│   │   ├── SyncManifest.swift   # Transactional revisions, deletion ledger and migration-safe dual-hash snapshot lineage
+│   │   ├── BackupKeyStore.swift # Wrapped backup keys, Shared recovery phrase codec, explicit rotation archives
+│   │   └── ObjectCrypto.swift   # RBC1 streaming AES-GCM object encryption with authenticated headers/chunks
 │   └── Tests/
 │       └── SyncManifestTests.swift # SQLite revision/deletion/reopen, lineage migration and state safety fixtures
 │

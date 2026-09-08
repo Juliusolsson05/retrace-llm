@@ -1,6 +1,8 @@
 import Foundation
 import XCTest
 import SQLCipher
+import CryptoKit
+import Shared
 @testable import Storage
 
 final class SyncManifestTests: XCTestCase {
@@ -18,6 +20,175 @@ final class SyncManifestTests: XCTestCase {
     }
 
     override func tearDownWithError() throws { try FileManager.default.removeItem(at: sandbox) }
+
+    func testBackupKeyUsesSharedRecoveryDerivationAndPersistsOnlyWrappedMaterial() async throws {
+        let fixedPhrase = Array(repeating: "bab", count: 21).joined(separator: " ") + " beaj"
+        let fixedKey = try MasterKeyManager.keyData(fromRecoveryPhrase: fixedPhrase)
+        XCTAssertEqual(fixedKey, Data(repeating: 0, count: 32))
+        let wrapping = try BackupKeyStore.wrappingKey(from: fixedPhrase)
+        XCTAssertEqual(wrapping.withUnsafeBytes { Data($0) }, fixedKey)
+        let created = try await BackupKeyStore.initialize(root: state, sourceRoot: source)
+        let key = try await BackupKeyStore.unwrap(root: state, sourceRoot: source, phrase: created.recoveryPhrase)
+        let raw = key.material.withUnsafeBytes { Data($0) }
+        XCTAssertEqual(raw.count, 32)
+        let bytes = try Data(contentsOf: state.appendingPathComponent("backup-key.json"))
+        let permissions = try FileManager.default.attributesOfItem(atPath: state.appendingPathComponent("backup-key.json").path)
+        XCTAssertEqual((permissions[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        XCTAssertNil(bytes.range(of: raw))
+        XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains(raw.base64EncodedString()))
+        XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains(created.recoveryPhrase))
+        let record = try JSONDecoder().decode(BackupKeyStore.Record.self, from: bytes)
+        let box = try AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: record.nonce),
+            ciphertext: record.wrappedKey.dropLast(16), tag: record.wrappedKey.suffix(16))
+        // Shared's public decoder is the actual master-key recovery path, without Keychain I/O.
+        let sharedKey = SymmetricKey(data: try MasterKeyManager.keyData(fromRecoveryPhrase: created.recoveryPhrase))
+        XCTAssertEqual(try AES.GCM.open(box, using: sharedKey, authenticating: record.authenticatedData()), raw)
+    }
+
+    func testBackupKeyWrongPhraseRotationAndArchivedWrappedEntry() async throws {
+        let first = try await BackupKeyStore.initialize(root: state, sourceRoot: source)
+        let original = try Data(contentsOf: state.appendingPathComponent("backup-key.json"))
+        let second = try await BackupKeyStore.initialize(root: state, sourceRoot: source, rotate: true)
+        XCTAssertNotEqual(first.status.keyId, second.status.keyId)
+        do {
+            _ = try await BackupKeyStore.unwrap(root: state, sourceRoot: source, phrase: first.recoveryPhrase)
+            XCTFail("Old phrase unlocked the rotated key")
+        } catch { XCTAssertEqual(error as? BackupKeyError, .unlockFailed) }
+        _ = try await BackupKeyStore.unwrap(root: state, sourceRoot: source, phrase: second.recoveryPhrase)
+        let archive = state.appendingPathComponent("backup-key-\(first.status.keyId!).json")
+        XCTAssertEqual(try Data(contentsOf: archive), original)
+        // Recovery from an archived entry works in independent state with its original phrase.
+        let recovered = sandbox.appendingPathComponent("recovered")
+        try FileManager.default.createDirectory(at: recovered, withIntermediateDirectories: true)
+        try original.write(to: recovered.appendingPathComponent("backup-key.json"))
+        let old = try await BackupKeyStore.unwrap(root: recovered, sourceRoot: source, phrase: first.recoveryPhrase)
+        XCTAssertEqual(old.keyId, first.status.keyId)
+    }
+
+    func testBackupKeyRejectsAliasesAndAuthenticatedMetadataChanges() async throws {
+        let created = try await BackupKeyStore.initialize(root: state, sourceRoot: source)
+        let file = state.appendingPathComponent("backup-key.json")
+        let bytes = try Data(contentsOf: file)
+        for field in ["keyId", "createdAtMs", "kdfParams", "version", "nonce", "wrappedKey"] {
+            var json = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+            if field == "keyId" { json[field] = UUID().uuidString }
+            else if field == "createdAtMs" { json[field] = 1 }
+            else if field == "version" { json[field] = 2 }
+            else if field == "kdfParams" { json[field] = ["algorithm": "other"] }
+            else { json[field] = Data(repeating: 0, count: field == "nonce" ? 12 : 48).base64EncodedString() }
+            try JSONSerialization.data(withJSONObject: json).write(to: file)
+            do {
+                _ = try await BackupKeyStore.unwrap(root: state, sourceRoot: source, phrase: created.recoveryPhrase)
+                XCTFail("Accepted modified \(field)")
+            } catch { }
+        }
+        try FileManager.default.removeItem(at: file)
+        let sourceFile = source.appendingPathComponent("retrace.db")
+        try bytes.write(to: sourceFile)
+        for symlink in [true, false] {
+            if symlink { try FileManager.default.createSymbolicLink(at: file, withDestinationURL: sourceFile) }
+            else { try FileManager.default.linkItem(at: sourceFile, to: file) }
+            do {
+                _ = try await BackupKeyStore.initialize(root: state, sourceRoot: source, rotate: true)
+                XCTFail("Accepted key-file alias")
+            } catch { XCTAssertEqual(error as? SyncManifestError, .unsafeStateRoot) }
+            XCTAssertEqual(try Data(contentsOf: sourceFile), bytes)
+            try FileManager.default.removeItem(at: file)
+        }
+    }
+
+    func testObjectCryptoRoundTripsChunkBoundariesAndHashesEntireContainer() async throws {
+        let key = ObjectCrypto.Key(keyId: UUID().uuidString, material: SymmetricKey(size: .bits256))
+        for size in [0, 1, 1_048_576, 3 * 1_048_576 + 73] {
+            let file = sandbox.appendingPathComponent("plain")
+            let bytes = Data((0..<size).map { UInt8(truncatingIfNeeded: $0 &* 31) })
+            try bytes.write(to: file)
+            let encrypted = try await ObjectCrypto.encryptFile(file, objectKey: "chunks/202609/08/1", key: key)
+            defer { try? FileManager.default.removeItem(at: encrypted) }
+            let container = try Data(contentsOf: encrypted)
+            XCTAssertEqual(container.prefix(4), Data("RBC1".utf8))
+            let hash = try await ObjectCrypto.sha256(file: encrypted)
+            XCTAssertEqual(hash, SHA256.hash(data: container).map { String(format: "%02x", $0) }.joined())
+            let decrypted = try await ObjectCrypto.decryptFile(encrypted, objectKey: "chunks/202609/08/1", key: key)
+            defer { try? FileManager.default.removeItem(at: decrypted) }
+            XCTAssertEqual(try Data(contentsOf: decrypted), bytes)
+        }
+    }
+
+    func testObjectCryptoRejectsTamperingWrongAADKeyIDAndReorderedChunks() async throws {
+        let key = ObjectCrypto.Key(keyId: UUID().uuidString, material: SymmetricKey(size: .bits256))
+        let file = sandbox.appendingPathComponent("plain")
+        try Data(repeating: 37, count: 3 * 1_048_576 + 17).write(to: file)
+        let encrypted = try await ObjectCrypto.encryptFile(file, objectKey: "object", key: key)
+        defer { try? FileManager.default.removeItem(at: encrypted) }
+        let original = try Data(contentsOf: encrypted)
+        let header = 57 // RBC1 + version byte + UUID (36 UTF-8 bytes) + UInt64 length/count.
+        let chunk = 1_048_576 + 28
+        var variants: [Data] = []
+        for offset in [4, 5, 41, 49, header, header + 12, header + chunk - 1, original.count - 1] {
+            var changed = original
+            changed[offset] ^= 1
+            variants.append(changed)
+        }
+        var reordered = original
+        reordered.replaceSubrange(header..<(header + chunk), with: original[(header + chunk)..<(header + 2 * chunk)])
+        reordered.replaceSubrange((header + chunk)..<(header + 2 * chunk), with: original[header..<(header + chunk)])
+        variants += [reordered, Data(original.dropLast()), original + Data([0])]
+        for bytes in variants {
+            try bytes.write(to: encrypted)
+            do {
+                let output = try await ObjectCrypto.decryptFile(encrypted, objectKey: "object", key: key)
+                try? FileManager.default.removeItem(at: output)
+                XCTFail("Tampered container decrypted")
+            } catch { }
+        }
+        try original.write(to: encrypted)
+        for (object, candidate) in [("wrong", key), ("object", ObjectCrypto.Key(keyId: UUID().uuidString, material: key.material)),
+                                     ("object", ObjectCrypto.Key(keyId: key.keyId, material: SymmetricKey(size: .bits256)))] {
+            do {
+                let output = try await ObjectCrypto.decryptFile(encrypted, objectKey: object, key: candidate)
+                try? FileManager.default.removeItem(at: output)
+                XCTFail("Wrong AAD/key accepted")
+            } catch { }
+        }
+        let forgedID = UUID().uuidString
+        var forged = original
+        forged.replaceSubrange(5..<41, with: Data(forgedID.utf8))
+        try forged.write(to: encrypted)
+        do {
+            let output = try await ObjectCrypto.decryptFile(encrypted, objectKey: "object",
+                key: ObjectCrypto.Key(keyId: forgedID, material: key.material))
+            try? FileManager.default.removeItem(at: output)
+            XCTFail("Header key ID must be authenticated even when it matches the supplied ID")
+        } catch { }
+    }
+
+    func testSnapshotPlainHashMigratesLegacyLineageWithoutReadOnlyWrites() async throws {
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: source)
+        _ = try await manifest.recordSnapshot(createdMs: 1, sizeBytes: 10, sha256: firstHash, frameCount: 0,
+            videoCount: 0, lineageTag: "old", snapshotPath: "/old")
+        try await manifest.close()
+        var db: OpaquePointer?
+        let file = state.appendingPathComponent(SyncManifest.filename)
+        XCTAssertEqual(sqlite3_open(file.path, &db), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "ALTER TABLE snapshots DROP COLUMN plainSha256", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let before = try Data(contentsOf: file)
+        let readonly = try await SyncManifest.open(root: state, sourceRoot: source, readOnly: true)
+        let old = try await readonly.lookupSnapshot(sha256: firstHash, snapshotPath: "/old")
+        XCTAssertNil(old?.plainSha256)
+        try await readonly.close()
+        XCTAssertEqual(try Data(contentsOf: file), before)
+        let migrated = try await SyncManifest.open(root: state, sourceRoot: source)
+        _ = try await migrated.recordSnapshot(createdMs: 2, sizeBytes: 20, sha256: secondHash, frameCount: 0,
+            videoCount: 0, lineageTag: "encrypted", snapshotPath: "/new", plainSha256: firstHash)
+        try await migrated.close()
+        let reopened = try await SyncManifest.open(root: state, sourceRoot: source, readOnly: true)
+        let row = try await reopened.lookupSnapshot(sha256: secondHash, snapshotPath: "/new")
+        XCTAssertEqual(row?.plainSha256, firstHash)
+        XCTAssertEqual(row?.sha256, secondHash)
+        try await reopened.close()
+    }
 
     func testRecordLookupPendingAndUploadedSurviveSequentialConnections() async throws {
         let first = try await SyncManifest.open(root: state, sourceRoot: source)

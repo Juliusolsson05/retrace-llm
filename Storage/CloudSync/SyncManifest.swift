@@ -33,6 +33,7 @@ public actor SyncManifest {
         public let videoCount: Int64
         public let lineageTag: String
         public let snapshotPath: String
+        public let plainSha256: String?
     }
 
     private var db: OpaquePointer?
@@ -123,8 +124,11 @@ public actor SyncManifest {
                         PRIMARY KEY(objectKey, deletedAtMs)
                     );
                     PRAGMA user_version=1;
-                    COMMIT;
                     """)
+                if try !Self.hasPlainSnapshotHash(handle) {
+                    try Self.execute(handle, "ALTER TABLE snapshots ADD COLUMN plainSha256 TEXT CHECK(plainSha256 IS NULL OR length(plainSha256)=64);")
+                }
+                try Self.execute(handle, "COMMIT;")
             }
             // Validate the shape even when the table has no rows. No app migrations run.
             var statement: OpaquePointer?
@@ -258,17 +262,24 @@ public actor SyncManifest {
 
     @discardableResult
     public func recordSnapshot(createdMs: Int64, sizeBytes: Int64, sha256: String, frameCount: Int64,
-                               videoCount: Int64, lineageTag: String, snapshotPath: String) throws -> Snapshot {
+                               videoCount: Int64, lineageTag: String, snapshotPath: String,
+                               plainSha256: String? = nil) throws -> Snapshot {
         try transaction { db in
             guard createdMs >= 0, sizeBytes > 0, frameCount >= 0, videoCount >= 0,
                   sha256.utf8.count == 64, sha256.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
                   !lineageTag.isEmpty, !lineageTag.contains("\0"), snapshotPath.hasPrefix("/"),
                   !snapshotPath.contains("\0") else { throw SyncManifestError.invalidRecord }
+            if let plainSha256 {
+                guard plainSha256.utf8.count == 64,
+                      plainSha256.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                    throw SyncManifestError.invalidRecord
+                }
+            }
             var statement: OpaquePointer?
             defer { sqlite3_finalize(statement) }
             try Self.prepare(db, """
-                INSERT INTO snapshots(createdMs,sizeBytes,sha256,frameCount,videoCount,lineageTag,snapshotPath)
-                VALUES(?,?,?,?,?,?,?)
+                INSERT INTO snapshots(createdMs,sizeBytes,sha256,frameCount,videoCount,lineageTag,snapshotPath,plainSha256)
+                VALUES(?,?,?,?,?,?,?,?)
                 """, &statement)
             sqlite3_bind_int64(statement, 1, createdMs)
             sqlite3_bind_int64(statement, 2, sizeBytes)
@@ -277,10 +288,12 @@ public actor SyncManifest {
             sqlite3_bind_int64(statement, 5, videoCount)
             try Self.bind(lineageTag, to: statement, at: 6)
             try Self.bind(snapshotPath, to: statement, at: 7)
+            if let plainSha256 { try Self.bind(plainSha256, to: statement, at: 8) }
+            else { sqlite3_bind_null(statement, 8) }
             guard sqlite3_step(statement) == SQLITE_DONE else { throw SyncManifestError.unavailable }
             return Snapshot(id: sqlite3_last_insert_rowid(db), createdMs: createdMs, sizeBytes: sizeBytes,
                             sha256: sha256, frameCount: frameCount, videoCount: videoCount,
-                            lineageTag: lineageTag, snapshotPath: snapshotPath)
+                            lineageTag: lineageTag, snapshotPath: snapshotPath, plainSha256: plainSha256)
         }
     }
 
@@ -294,13 +307,14 @@ public actor SyncManifest {
         // A slice-5 manifest remains readable without migrating during verify/dry-run.
         if status == SQLITE_DONE { return nil }
         guard status == SQLITE_ROW else { throw SyncManifestError.unavailable }
+        let plainColumn = try Self.hasPlainSnapshotHash(db) ? "plainSha256" : "NULL"
         // A known path must match its own latest lineage, even if substituted bytes
         // happen to match another snapshot. Hash fallback permits moved/copied backups.
         for (column, value) in [("snapshotPath", snapshotPath), ("sha256", sha256)] {
             var statement: OpaquePointer?
             defer { sqlite3_finalize(statement) }
             try Self.prepare(db, """
-                SELECT id,createdMs,sizeBytes,sha256,frameCount,videoCount,lineageTag,snapshotPath
+                SELECT id,createdMs,sizeBytes,sha256,frameCount,videoCount,lineageTag,snapshotPath,\(plainColumn)
                 FROM snapshots WHERE \(column)=? ORDER BY createdMs DESC,id DESC LIMIT 1
                 """, &statement)
             try Self.bind(value, to: statement, at: 1)
@@ -314,7 +328,8 @@ public actor SyncManifest {
             return Snapshot(id: sqlite3_column_int64(statement, 0), createdMs: sqlite3_column_int64(statement, 1),
                             sizeBytes: sqlite3_column_int64(statement, 2), sha256: try text(3),
                             frameCount: sqlite3_column_int64(statement, 4), videoCount: sqlite3_column_int64(statement, 5),
-                            lineageTag: try text(6), snapshotPath: try text(7))
+                            lineageTag: try text(6), snapshotPath: try text(7),
+                            plainSha256: sqlite3_column_type(statement, 8) == SQLITE_NULL ? nil : try text(8))
         }
         return nil
     }
@@ -472,6 +487,15 @@ public actor SyncManifest {
         return true
     }
 
+    private static func hasPlainSnapshotHash(_ db: OpaquePointer) throws -> Bool {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        try prepare(db, "SELECT 1 FROM pragma_table_info('snapshots') WHERE name='plainSha256'", &statement)
+        let result = sqlite3_step(statement)
+        guard result == SQLITE_ROW || result == SQLITE_DONE else { throw SyncManifestError.unavailable }
+        return result == SQLITE_ROW
+    }
+
     private static func prepare(_ db: OpaquePointer, _ sql: String, _ statement: inout OpaquePointer?) throws {
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { throw SyncManifestError.unavailable }
     }
@@ -487,13 +511,13 @@ public actor SyncManifest {
 
     /// Mirrors CLIStateMetrics: reject source-contained state, symlink components,
     /// hardlinked DB/sidecars and an inverse source-DB symlink into proposed state.
-    private static func validateState(root: URL, sourceRoot: URL, create: Bool) throws -> Bool {
+    static func validateState(root: URL, sourceRoot: URL, create: Bool, filenames: [String]? = nil) throws -> Bool {
         guard root.isFileURL, sourceRoot.isFileURL,
               !root.pathComponents.contains(".."), !root.pathComponents.contains(".") else { throw SyncManifestError.unsafeStateRoot }
         let source = try canonicalPath(sourceRoot)
         let state = try canonicalPath(root)
         guard source != "/", state != source, !state.hasPrefix(source + "/") else { throw SyncManifestError.unsafeStateRoot }
-        let names = [filename, filename + "-journal", filename + "-wal", filename + "-shm"]
+        let names = filenames ?? [filename, filename + "-journal", filename + "-wal", filename + "-shm"]
         let sourceDB = try canonicalPath(sourceRoot.appendingPathComponent("retrace.db"))
         guard try !names.contains(where: { try canonicalPath(root.appendingPathComponent($0)) == sourceDB }) else {
             throw SyncManifestError.unsafeStateRoot

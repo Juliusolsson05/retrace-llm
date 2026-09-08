@@ -72,14 +72,19 @@ enum CLICommand {
         "swift run retrace-cli sync --dry-run [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli sync-plan --purge-day YYYY-MM-DD [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli purge-apply --day YYYY-MM-DD [--storage-root PATH] [--state-root PATH]",
-        "swift run retrace-cli snapshot [--storage-root PATH] [--state-root PATH]",
-        "swift run retrace-cli verify --snapshot PATH [--storage-root PATH] [--state-root PATH]",
-        "swift run retrace-cli restore --snapshot PATH --to DIR [--storage-root PATH] [--state-root PATH]",
+        "swift run retrace-cli key init|status|rotate [--state-root PATH] [--storage-root PATH]",
+        "swift run retrace-cli key unwrap --phrase-from-stdin [--state-root PATH] [--storage-root PATH]",
+        "swift run retrace-cli snapshot [--encrypt --phrase-from-stdin] [--storage-root PATH] [--state-root PATH]",
+        "swift run retrace-cli verify --snapshot PATH [--phrase-from-stdin] [--storage-root PATH] [--state-root PATH]",
+        "swift run retrace-cli restore --snapshot PATH --to DIR [--phrase-from-stdin] [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli export --day YYYY-MM-DD [--storage-root PATH] [--state-root PATH] [--limit N]",
+        "Key init explicitly creates a random backup key wrapped with AES-256-GCM by a NEW recovery master key. Its 22-word phrase is printed ONCE to stderr: save it privately offline. Only wrapped material is saved in state-root/backup-key.json. No app Keychain or credential access. Shared MasterKeyManager's custom syllabic recovery encoding is reused directly; it is not BIP39 and uses no PBKDF2, HKDF or salt. Key status prints presence/keyId/createdAtMs; key unwrap verifies stdin and prints status only. No phrase arguments or environment variables are accepted.",
+        "Encrypted snapshot requires prior key init and --phrase-from-stdin. Pipe the phrase on stdin for snapshot --encrypt, verify, and restore; no prompts or persistent unlocked-key cache. RBC1 magic auto-detects encrypted inputs regardless of extension. Its authenticated 1 MiB AES-GCM chunks bind header/keyId, logical object key, index and total length. Snapshot AAD uses the stable logical key snapshots/database so moved copies remain recoverable. sha256 identifies ciphertext; plainSha256 records plaintext in lineage. format reports RBC1 or sqlite. Only validated plaintext is restored to retrace.db.",
+        "Key rotate replaces the active key/phrase and invalidates prior objects for that active key. Old wrapped entries remain in backup-key-<keyId>.json and require their OLD phrase; new phrases cannot recover old objects. To recover old objects, copy their archived wrapped entry to backup-key.json in separate safe CLI state and supply the old phrase. Keep wrapped entries with backups. Restore does not require the old manifest or Keychain. Uploads remain disabled; object encryption must be always on when uploads are implemented.",
         "Build: swift build --product retrace-cli -j 4. Executable: .build/debug/retrace-cli. The installed command alias retrace is a later packaging step; the existing app product Retrace is separate.",
-        "stdout: one JSON object for help/status/baseline/sync/sync-plan/purge-apply/snapshot/verify/restore, schemaVersion=1; diagnostics: stderr. Export streams JSONL frames to stdout and one summary JSON object to stderr, including on failure. No prompts or application startup.",
+        "stdout: one JSON object for help/status/baseline/sync/sync-plan/purge-apply/key/snapshot/verify/restore, schemaVersion=1; diagnostics: stderr. Export streams JSONL frames to stdout and one summary JSON object to stderr, including on failure. No prompts or application startup.",
         "Exit codes: 0 complete, 2 invalid arguments/unsafe state path, 3 unavailable or unsupported source/manifest, 4 partial inventory/plan, 5 metrics/output failure, 6 upload_disabled.",
-        "Sync is local planning only: without --dry-run it exits 6 (upload_disabled). Privacy-deletion, cloud snapshot recovery and encryption contracts remain pending: docs/decomposition/optimization-and-cloud-sync.md, Plan gates before implementation continues.",
+        "Sync is local planning only: without --dry-run it exits 6 (upload_disabled). Privacy-deletion, complete cloud snapshot recovery and mandatory upload encryption enforcement remain pending: docs/decomposition/optimization-and-cloud-sync.md, Plan gates before implementation continues.",
         "Snapshot uses SQLite online backup from the read-only source connection into CLI state snapshots/<utc-ms>.db, including committed WAL rows. It pins a read transaction, copies 256 pages per step with bounded lock retries, and writes a standalone DELETE-mode database. It checks integrity, streams SHA-256 and records physical frame/video counts and lineage in sync-manifest.db. stdout includes absolute snapshotPath, sha256, sizeBytes, frameCount, videoCount, integrity, lineageId and elapsedMs.",
         "Verify recomputes integrity/counts/SHA-256 without writing the snapshot or manifest. The latest lineage for the snapshot path takes precedence; SHA-256 fallback supports moved copies. checks reports match/mismatch/unavailable per field and missing for an absent manifest row. Any mismatch, unavailable field or missing lineage exits 3. SQLite corruption still reports the hash comparison when the bytes are readable.",
         "Restore copies a standalone snapshot into an empty --to directory as retrace.db, then checks it read-only. A missing target is created. Nonempty targets, symlink components, hardlinked snapshots and source-contained paths are refused. --storage-root identifies the protected source for verify/restore and defaults to configured app storage; --state-root selects independent metrics/lineage state. Restore does not require lineage. Snapshots contain the whole database, including OCR; only metadata is printed. Media files, cloud recovery, encrypted sources and retention are outside this local database-only slice.",
@@ -98,21 +103,27 @@ enum CLICommand {
         "Inventory is bounded to 100000 entries and 10 seconds between metadata operations. A filesystem call itself may take longer. A limit or I/O error returns partial counts and exit 4. Missing chunks is empty only when the database has no video rows.",
         "Live results are observational, not an atomic database/filesystem snapshot. Elapsed time measures this command only, not OCR, compression or a performance improvement.",
         "The source VFS forbids creation/deletion and uses readonly_shm. WAL databases need existing readable WAL/SHM sidecars; otherwise access fails without repairing or creating them. No immutable mode is used, so live WAL data is not silently ignored.",
-        "Encryption-enabled app configuration is rejected before Keychain access; this stage does not request or load keys.",
+        "Encryption-enabled source app configuration is still rejected before Keychain access. Backup object encryption is independent of SQLCipher and OCR protection.",
         "Command metrics use an independent daily_metrics table in ~/Library/Application Support/RetraceCLI/metrics.db (override with --state-root). Metadata: command, outcome (started/succeeded/failed/partial), durationMs?, errorCode?, truncated (export only). No paths/content/keys. Source-contained, symlink or hardlink state aliases are rejected. Help/usage errors do not write metrics."
     ]
 
     static func run(arguments: [String], writeFrame: (@Sendable (Data) throws -> Void)? = nil) async -> CLIResult {
+        await run(arguments: arguments, readPhrase: { try CLIKeyCommand.readStdin() }, writeFrame: writeFrame)
+    }
+
+    static func run(arguments: [String], readPhrase: @escaping @Sendable () throws -> String,
+                    writeFrame: (@Sendable (Data) throws -> Void)? = nil) async -> CLIResult {
         // This executable never bootstraps an application. Blocking SQLite/POSIX work stays
         // on a worker even when the command runner is called from another async context.
         await Task.detached {
+            if arguments.first == "key" { return await CLIKeyCommand.execute(arguments: Array(arguments.dropFirst()), readPhrase: readPhrase) }
             if arguments.first == "sync" { return await executeSync(arguments: Array(arguments.dropFirst())) }
             if let command = arguments.first, ["sync-plan", "purge-apply"].contains(command) {
                 return await executePurge(command: command, arguments: Array(arguments.dropFirst()))
             }
             if arguments.first == "export" { return executeExport(arguments: Array(arguments.dropFirst()), writeFrame: writeFrame) }
             if let command = arguments.first, ["snapshot", "verify", "restore"].contains(command) {
-                return await executeSnapshotCommand(command: command, arguments: Array(arguments.dropFirst()))
+                return await executeSnapshotCommand(command: command, arguments: Array(arguments.dropFirst()), readPhrase: readPhrase)
             }
             return execute(arguments: arguments)
         }.value
@@ -304,7 +315,7 @@ enum CLICommand {
         }
     }
 
-    private static func executeSnapshotCommand(command: String, arguments: [String]) async -> CLIResult {
+    private static func executeSnapshotCommand(command: String, arguments: [String], readPhrase: @Sendable () throws -> String) async -> CLIResult {
         let started = ProcessInfo.processInfo.systemUptime
         var report = SnapshotReport(command: command)
         var metrics: CLIStateMetrics?
@@ -320,14 +331,24 @@ enum CLICommand {
             metrics = try CLIStateMetrics(root: state, sourceRoot: root)
             try metrics?.record(command: command, outcome: "started")
             if let file { try SnapshotStore.validateInput(file, root: root) }
+            let encrypted: Bool
+            if let file { encrypted = try await ObjectCrypto.isEncrypted(file) }
+            else { encrypted = options["--encrypt"] != nil }
+            report.format = encrypted ? "RBC1" : "sqlite"
+            var key: ObjectCrypto.Key?
+            if encrypted {
+                key = try await CLIKeyCommand.unlock(state: state, root: root, fromStdin: options["--phrase-from-stdin"] != nil, readPhrase: readPhrase)
+            } else if options["--phrase-from-stdin"] != nil { throw usage() }
             switch command {
-            case "snapshot": report = try await SnapshotStore.create(root: root, state: state)
-            case "verify": report = try await SnapshotStore.verify(file: file!, root: root, state: state)
-            default: report = try await SnapshotStore.restore(file: file!, target: target!, root: root)
+            case "snapshot": report = try await SnapshotStore.create(root: root, state: state, key: key)
+            case "verify": report = try await SnapshotStore.verify(file: file!, root: root, state: state, key: key)
+            default: report = try await SnapshotStore.restore(file: file!, target: target!, root: root, key: key)
             }
         } catch {
             let failure: CLIError
             if let cliError = error as? CLIError { failure = cliError }
+            else if error is BackupKeyError { failure = CLIKeyCommand.failure(error) }
+            else if error is ObjectCryptoError { failure = CLIError("object_authentication_failed", "Encrypted object could not be authenticated or read.") }
             else if error as? SyncManifestError == .unsafeStateRoot {
                 failure = CLIError("unsafe_state_root", "Snapshot lineage state must be outside source storage without symlink or hardlink aliases.", exitCode: 2)
             } else if error is SyncManifestError {
@@ -448,12 +469,12 @@ enum CLICommand {
         return date
     }
 
-    private static func usage() -> CLIError {
+    static func usage() -> CLIError {
         CLIError("usage", "Expected required command arguments and each supported option at most once; see swift run retrace-cli help.", exitCode: 2)
     }
 
-    private static func parseOptions(_ arguments: [String], export: Bool = false, sync: Bool = false,
-                                     snapshotCommand: String? = nil, purgeCommand: String? = nil) throws -> [String: String] {
+    static func parseOptions(_ arguments: [String], export: Bool = false, sync: Bool = false,
+                             snapshotCommand: String? = nil, purgeCommand: String? = nil, keyCommand: String? = nil) throws -> [String: String] {
         var allowed = ["--storage-root", "--state-root"]
         if export { allowed += ["--day", "--limit"] }
         if snapshotCommand == "verify" || snapshotCommand == "restore" { allowed.append("--snapshot") }
@@ -464,7 +485,10 @@ enum CLICommand {
         var index = 0
         while index < arguments.count {
             let option = arguments[index]
-            if sync, option == "--dry-run", values[option] == nil {
+            let flag = (sync && option == "--dry-run")
+                || (snapshotCommand == "snapshot" && option == "--encrypt")
+                || ((snapshotCommand != nil || keyCommand == "unwrap") && option == "--phrase-from-stdin")
+            if flag, values[option] == nil {
                 values[option] = "true"
                 index += 1
                 continue

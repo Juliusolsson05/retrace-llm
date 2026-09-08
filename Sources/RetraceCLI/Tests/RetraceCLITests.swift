@@ -916,6 +916,192 @@ final class RetraceCLITests: XCTestCase {
         return (URL(fileURLWithPath: path), report)
     }
 
+    private func keyCommand(_ action: String, extra: [String] = []) async -> CLIResult {
+        await CLICommand.run(arguments: ["key", action, "--storage-root", root.path, "--state-root", state.path] + extra)
+    }
+
+    func testBackupKeyInitStatusAndRotationKeepRecoveryPhraseOutOfJSONAndMetrics() async throws {
+        let absent = try json(await keyCommand("status"))
+        XCTAssertEqual(absent["present"] as? Bool, false)
+        let initialized = await keyCommand("init")
+        XCTAssertEqual(initialized.exitCode, 0)
+        let phrase = try MasterKeyManager.recoveryPhrase(fromRecoveryText: initialized.stderr)
+        XCTAssertEqual(initialized.stderr.components(separatedBy: phrase).count, 2)
+        let created = try json(initialized)
+        XCTAssertEqual(created["present"] as? Bool, true)
+        XCTAssertNotNil(created["createdAtMs"] as? Int64)
+        let keyID = try XCTUnwrap(created["keyId"] as? String)
+        let status = await keyCommand("status")
+        XCTAssertEqual(try json(status)["keyId"] as? String, keyID)
+        XCTAssertTrue(status.stderr.isEmpty)
+        let file = state.appendingPathComponent("backup-key.json")
+        let original = try Data(contentsOf: file)
+        let stored = try XCTUnwrap(JSONSerialization.jsonObject(with: original) as? [String: Any])
+        XCTAssertEqual(Set(stored.keys), ["version", "wrappedKey", "nonce", "kdfParams", "createdAtMs", "keyId"])
+        XCTAssertEqual(stored["version"] as? Int, 1)
+        let duplicate = await keyCommand("init")
+        try assertError(duplicate, "backup_key_exists")
+        XCTAssertEqual(try Data(contentsOf: file), original)
+        let rotated = await keyCommand("rotate")
+        XCTAssertEqual(rotated.exitCode, 0)
+        let newPhrase = try MasterKeyManager.recoveryPhrase(fromRecoveryText: rotated.stderr)
+        XCTAssertNotEqual(try json(rotated)["keyId"] as? String, keyID)
+        XCTAssertNotEqual(newPhrase, phrase)
+        for result in [initialized, status, rotated, duplicate] {
+            let stdout = String(decoding: result.stdout, as: UTF8.self)
+            XCTAssertFalse(stdout.contains(phrase))
+            XCTAssertFalse(stdout.contains(newPhrase))
+        }
+        let metrics = String(decoding: try Data(contentsOf: state.appendingPathComponent("metrics.db")), as: UTF8.self)
+        for field in ["wrappedKey", "nonce"] {
+            let material = try XCTUnwrap(stored[field] as? String)
+            XCTAssertFalse(metrics.contains(material))
+            XCTAssertFalse(String(decoding: initialized.stdout, as: UTF8.self).contains(material))
+        }
+        XCTAssertFalse(metrics.contains(phrase))
+        XCTAssertFalse(metrics.contains(newPhrase))
+        XCTAssertFalse(metrics.contains(keyID))
+        XCTAssertTrue(metrics.contains("key init"))
+        XCTAssertTrue(metrics.contains("key status"))
+        XCTAssertTrue(metrics.contains("key rotate"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+    }
+
+    func testEncryptedSnapshotRequiresExplicitKeyInitializationBeforeSourceAccess() async throws {
+        let result = await run("snapshot", extra: ["--encrypt"])
+        XCTAssertEqual(result.exitCode, 2)
+        try assertError(result, "backup_key_missing")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.appendingPathComponent("backup-key.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.appendingPathComponent("snapshots").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+    }
+
+    func testBackupKeyRejectsSourceContainedState() async throws {
+        let result = await CLICommand.run(arguments: ["key", "init", "--storage-root", root.path, "--state-root", root.path])
+        try assertError(result, "unsafe_state_root")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+    }
+
+    func testBackupKeyRecoveryPhraseIsEmittedEvenWhenStdoutPipeIsClosed() throws {
+        let command = Process()
+        command.executableURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/debug/retrace-cli")
+        command.arguments = ["key", "init", "--storage-root", root.path, "--state-root", state.path]
+        let broken = Pipe()
+        try broken.fileHandleForReading.close()
+        command.standardOutput = broken.fileHandleForWriting
+        let diagnostics = Pipe()
+        command.standardError = diagnostics
+        command.standardInput = FileHandle.nullDevice
+        try command.run()
+        try broken.fileHandleForWriting.close()
+        let bytes = diagnostics.fileHandleForReading.readDataToEndOfFile()
+        command.waitUntilExit()
+        XCTAssertEqual(command.terminationReason, .exit)
+        XCTAssertEqual(command.terminationStatus, 5)
+        let stderr = String(decoding: bytes, as: UTF8.self)
+        let phrase = try MasterKeyManager.recoveryPhrase(fromRecoveryText: stderr)
+        XCTAssertEqual(stderr.components(separatedBy: phrase).count, 2)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: state.appendingPathComponent("backup-key.json").path))
+    }
+
+    private func phraseCommand(_ command: String, phrase: String, extra: [String] = []) async -> CLIResult {
+        await CLICommand.run(arguments: [command] + extra + ["--storage-root", root.path, "--state-root", state.path,
+            "--phrase-from-stdin"], readPhrase: { phrase })
+    }
+
+    func testBackupKeyUnwrapStdinAndWrongPhraseAreSanitized() async throws {
+        let initialized = await keyCommand("init")
+        let phrase = try MasterKeyManager.recoveryPhrase(fromRecoveryText: initialized.stderr)
+        let unlocked = await phraseCommand("key", phrase: phrase, extra: ["unwrap"])
+        XCTAssertEqual(unlocked.exitCode, 0, unlocked.stderr)
+        XCTAssertEqual(try json(unlocked)["unlocked"] as? Bool, true)
+        let badPhrase = "private-invalid-phrase-never-echo"
+        let failed = await phraseCommand("key", phrase: badPhrase, extra: ["unwrap"])
+        try assertError(failed, "backup_key_unlock_failed")
+        for result in [unlocked, failed] {
+            for secret in [phrase, badPhrase] {
+                XCTAssertFalse(String(decoding: result.stdout, as: UTF8.self).contains(secret))
+                XCTAssertFalse(result.stderr.contains(secret))
+            }
+        }
+        let metrics = String(decoding: try Data(contentsOf: state.appendingPathComponent("metrics.db")), as: UTF8.self)
+        XCTAssertFalse(metrics.contains(phrase))
+        XCTAssertFalse(metrics.contains(badPhrase))
+        try assertError(await keyCommand("unwrap"), "usage")
+        try assertError(await keyCommand("init", extra: ["--phrase-from-stdin"]), "usage")
+        try assertError(await run("snapshot", extra: ["--encrypt"]), "phrase_required")
+    }
+
+    func testEncryptedSnapshotVerifyRestoreDetectMagicAndKeepBothLineageHashes() async throws {
+        try await initialize(seed: true)
+        let before = try sourceFingerprint()
+        let initialized = await keyCommand("init")
+        let phrase = try MasterKeyManager.recoveryPhrase(fromRecoveryText: initialized.stderr)
+        let result = await phraseCommand("snapshot", phrase: phrase, extra: ["--encrypt"])
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        let report = try json(result)
+        XCTAssertEqual(report["format"] as? String, "RBC1")
+        let file = URL(fileURLWithPath: try XCTUnwrap(report["snapshotPath"] as? String))
+        XCTAssertEqual(try Data(contentsOf: file).prefix(4), Data("RBC1".utf8))
+        let ciphertextHash = try await ObjectCrypto.sha256(file: file)
+        XCTAssertEqual(report["sha256"] as? String, ciphertextHash)
+        XCTAssertNotEqual(report["sha256"] as? String, report["plainSha256"] as? String)
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: root, readOnly: true)
+        let row = try await manifest.lookupSnapshot(sha256: ciphertextHash, snapshotPath: file.path)
+        XCTAssertEqual(row?.plainSha256, report["plainSha256"] as? String)
+        try await manifest.close()
+        // Rename across directories: AAD uses a logical snapshot key, not the local path.
+        let moved = sandbox.appendingPathComponent("moved-backup")
+        try FileManager.default.copyItem(at: file, to: moved)
+        let verified = await phraseCommand("verify", phrase: phrase, extra: ["--snapshot", moved.path])
+        XCTAssertEqual(verified.exitCode, 0, verified.stderr)
+        XCTAssertEqual(try json(verified)["format"] as? String, "RBC1")
+        XCTAssertEqual((try json(verified)["checks"] as? [String: String])?["plainSha256"], "match")
+        let target = sandbox.appendingPathComponent("restored-encrypted")
+        let restored = await phraseCommand("restore", phrase: phrase, extra: ["--snapshot", moved.path, "--to", target.path])
+        XCTAssertEqual(restored.exitCode, 0, restored.stderr)
+        XCTAssertEqual(try json(restored)["format"] as? String, "RBC1")
+        let restoredFile = target.appendingPathComponent("retrace.db")
+        try snapshotReadCounts(restoredFile, frames: 2, videos: 1)
+        let plainHash = try await ObjectCrypto.sha256(file: restoredFile)
+        XCTAssertEqual(plainHash, row?.plainSha256)
+        XCTAssertEqual(try sourceFingerprint(), before)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: file.deletingLastPathComponent().path), [file.lastPathComponent])
+        for output in [result, verified, restored] {
+            XCTAssertFalse(String(decoding: output.stdout, as: UTF8.self).contains(phrase))
+            XCTAssertFalse(output.stderr.contains(phrase))
+        }
+        try assertError(await run("verify", extra: ["--snapshot", moved.path]), "phrase_required")
+        var corrupt = try Data(contentsOf: moved)
+        corrupt[corrupt.count - 1] ^= 1
+        try corrupt.write(to: moved)
+        let rejected = await phraseCommand("verify", phrase: phrase, extra: ["--snapshot", moved.path])
+        XCTAssertNotEqual(rejected.exitCode, 0)
+        let badTarget = sandbox.appendingPathComponent("bad-encrypted-restore")
+        let failed = await phraseCommand("restore", phrase: phrase, extra: ["--snapshot", moved.path, "--to", badTarget.path])
+        XCTAssertNotEqual(failed.exitCode, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: badTarget.appendingPathComponent("retrace.db").path))
+    }
+
+    func testEncryptedRestoreNeedsOnlyWrappedKeyAndPhraseWithoutOriginalState() async throws {
+        try await initialize(seed: true)
+        let initialized = await keyCommand("init")
+        let phrase = try MasterKeyManager.recoveryPhrase(fromRecoveryText: initialized.stderr)
+        let snapshot = try json(await phraseCommand("snapshot", phrase: phrase, extra: ["--encrypt"]))
+        let path = try XCTUnwrap(snapshot["snapshotPath"] as? String)
+        let recoveredState = sandbox.appendingPathComponent("new-state")
+        try FileManager.default.createDirectory(at: recoveredState, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: state.appendingPathComponent("backup-key.json"),
+            to: recoveredState.appendingPathComponent("backup-key.json"))
+        let target = sandbox.appendingPathComponent("new-machine")
+        let restored = await CLICommand.run(arguments: ["restore", "--snapshot", path, "--to", target.path,
+            "--storage-root", root.path, "--state-root", recoveredState.path, "--phrase-from-stdin"], readPhrase: { phrase })
+        XCTAssertEqual(restored.exitCode, 0, restored.stderr)
+        try snapshotReadCounts(target.appendingPathComponent("retrace.db"), frames: 2, videos: 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: recoveredState.appendingPathComponent(SyncManifest.filename).path))
+    }
+
     private func snapshotReadCounts(_ file: URL, frames: Int64, videos: Int64) throws {
         var db: OpaquePointer?
         XCTAssertEqual(sqlite3_open_v2(file.path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)

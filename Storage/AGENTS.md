@@ -15,7 +15,9 @@ Storage/
 ├── ImageExtractor.swift         # Video frame extraction and generator cache
 ├── StorageModuleError.swift     # Module-local errors
 ├── CloudSync/
-│   └── SyncManifest.swift       # CLI-state-only revisions, deletion ledger and snapshot lineage; no app database writes
+│   ├── SyncManifest.swift       # CLI-state-only revisions, deletion ledger and dual-hash snapshot lineage
+│   ├── BackupKeyStore.swift     # Wrapped keys, Shared recovery codec, atomic rotation and wrapped archives
+│   └── ObjectCrypto.swift       # RBC1 bounded-memory AES-GCM objects; authenticated header, identity and chunk order
 ├── WAL/
 │   ├── WALManager.swift
 │   └── RecoveryManager.swift
@@ -27,7 +29,7 @@ Storage/
 │   └── FrameConverter.swift     # Pixel format conversion
 └── Tests/
     ├── StorageManagerTests.swift
-    ├── SyncManifestTests.swift  # CRUD/revisions/deletion/reopen, lineage migration and state-root safety
+    ├── SyncManifestTests.swift  # Revisions/deletion, lineage migration, key recovery/rotation and chunk authentication
     ├── DirectoryManagerTests.swift
     ├── TestLogger.swift
     └── HEVCEncoderTests.swift
@@ -324,7 +326,13 @@ only in the independent CLI state root, never in app storage. Dry runs open it
 read-only and do not create it. B2 networking and upload policy remain CLI concerns;
 Local database snapshots, lineage and a durable deletion-intent ledger are implemented
 by the CLI. Ledger keys remain suppressed after local acknowledgement; provider-version
-and snapshot purge execution, media recovery and cloud encryption remain pending gates.
+and snapshot purge execution and media recovery remain pending gates. Backup object
+encryption uses RBC1 with an independent 32-byte key wrapped by a NEW recovery master
+key. Shared's public 22-word syllabic codec is reused directly (no BIP39/PBKDF2/HKDF,
+no salt, no Keychain). Only wrapped JSON persists; commands unlock via explicit stdin.
+Rotation archives the old wrapped JSON but invalidates old objects for the active key;
+recover them with their archived entry and old phrase in separate CLI state. Uploads
+remain disabled and must always use client object encryption once implemented.
 
 - **Input from**: CAPTURE module (CapturedFrame to encode and store)
 - **Output to**: UI (frame data for playback), DATABASE (VideoSegment metadata via App layer)

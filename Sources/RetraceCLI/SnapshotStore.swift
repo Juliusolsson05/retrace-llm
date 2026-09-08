@@ -12,6 +12,8 @@ struct SnapshotReport: Encodable, Sendable {
     var snapshotPath: String?
     var restoredPath: String?
     var sha256: String?
+    var plainSha256: String?
+    var format = "sqlite"
     var sizeBytes: Int64?
     var frameCount: Int64?
     var videoCount: Int64?
@@ -30,7 +32,11 @@ struct SnapshotReport: Encodable, Sendable {
 /// Local database recovery points only. All work runs on the command worker; the
 /// source connection and its VFS retain the same no-write policy as evidence reads.
 enum SnapshotStore {
-    static func create(root: URL, state: URL) async throws -> SnapshotReport {
+    // Logical identity is independent of local placement so copied/moved containers
+    // remain recoverable without the original manifest. Content identity is SHA256.
+    private static let objectKey = "snapshots/database"
+
+    static func create(root: URL, state: URL, key: ObjectCrypto.Key? = nil) async throws -> SnapshotReport {
         let directoryURL = state.appendingPathComponent("snapshots", isDirectory: true)
         try outsideSource(directoryURL, root: root, code: "unsafe_state_root")
         let directory = try openDirectory(directoryURL, create: true, code: "unsafe_state_root")
@@ -50,9 +56,20 @@ enum SnapshotStore {
         var complete = false
         defer { if !complete { removeDatabase(directory: directory, name: name) } }
         try backup(root: root, destination: file)
-        let measurement = try await measure(file)
+        var measurement = try await measure(file)
         guard measurement.integrity == "ok", let frames = measurement.frameCount,
               let videos = measurement.videoCount else { throw integrityFailure() }
+        if let key {
+            let encrypted = try await ObjectCrypto.encryptFile(file, objectKey: objectKey, key: key, temporaryDirectory: directoryURL)
+            defer { unlinkat(directory, encrypted.lastPathComponent, 0) }
+            guard renameat(directory, encrypted.lastPathComponent, directory, name) == 0 else { throw unavailable() }
+            let plainHash = measurement.sha256
+            let encryptedDigest = try await digest(file)
+            measurement.sha256 = encryptedDigest.sha256
+            measurement.sizeBytes = encryptedDigest.sizeBytes
+            measurement.plainSha256 = plainHash
+            measurement.format = "RBC1"
+        }
         // Persist the new directory entry before committing lineage that refers to it.
         guard fsync(directory) == 0 else { throw unavailable() }
         let manifest = try await SyncManifest.open(root: state, sourceRoot: root)
@@ -60,7 +77,8 @@ enum SnapshotStore {
         do {
             row = try await manifest.recordSnapshot(createdMs: createdMs, sizeBytes: measurement.sizeBytes!,
                 sha256: measurement.sha256!, frameCount: frames, videoCount: videos,
-                lineageTag: "sqlite-online-backup-v1", snapshotPath: file.path)
+                lineageTag: key == nil ? "sqlite-online-backup-v1" : "sqlite-online-backup-rbc1-v1",
+                snapshotPath: file.path, plainSha256: measurement.plainSha256)
             try await manifest.close()
         } catch {
             try? await manifest.close()
@@ -73,8 +91,8 @@ enum SnapshotStore {
         return report
     }
 
-    static func verify(file: URL, root: URL, state: URL) async throws -> SnapshotReport {
-        var report = try await measure(file, command: "verify")
+    static func verify(file: URL, root: URL, state: URL, key: ObjectCrypto.Key? = nil) async throws -> SnapshotReport {
+        var report = try await measure(file, command: "verify", key: key)
         let manifest = try await SyncManifest.open(root: state, sourceRoot: root, readOnly: true)
         let row: SyncManifest.Snapshot?
         do {
@@ -97,6 +115,9 @@ enum SnapshotStore {
             "videoCount": match(report.videoCount, row?.videoCount),
             "integrity": report.integrity == "ok" ? "match" : "mismatch"
         ]
+        if report.format == "RBC1" || row?.plainSha256 != nil {
+            report.checks?["plainSha256"] = match(report.plainSha256, row?.plainSha256)
+        }
         if row == nil {
             report.fail(CLIError("snapshot_lineage_missing", "No matching snapshot lineage exists in this CLI state."))
         } else if report.checks!.values.contains(where: { $0 != "match" }) {
@@ -105,15 +126,21 @@ enum SnapshotStore {
         return report
     }
 
-    static func restore(file: URL, target: URL, root: URL) async throws -> SnapshotReport {
+    static func restore(file: URL, target: URL, root: URL, key: ObjectCrypto.Key? = nil) async throws -> SnapshotReport {
         try outsideSource(target, root: root, code: "unsafe_restore_target")
         // Check existing directories before any copy and again after validating the
         // input. Exclusive creation below also refuses a racing retrace.db file.
         let directory = try openDirectory(target, create: true, code: "unsafe_restore_target")
         defer { close(directory) }
         try requireEmpty(directory)
-        let original = try await measure(file, command: "restore")
+        let original = try await measure(file, command: "restore", key: key)
         guard original.integrity == "ok" else { throw integrityFailure() }
+        var plaintext: URL?
+        defer { if let plaintext { try? FileManager.default.removeItem(at: plaintext) } }
+        if original.format == "RBC1" {
+            guard let key else { throw CLIError("phrase_required", "Encrypted restore requires the recovery phrase on stdin.", exitCode: 2) }
+            plaintext = try await ObjectCrypto.decryptFile(file, objectKey: objectKey, key: key)
+        }
         try requireEmpty(directory)
         let output = openat(directory, "retrace.db", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard output >= 0 else { throw unavailable() }
@@ -122,15 +149,21 @@ enum SnapshotStore {
             close(output)
             if !complete { removeDatabase(directory: directory, name: "retrace.db") }
         }
-        try copy(file, to: output)
+        try copy(plaintext ?? file, to: output)
         guard fsync(output) == 0 else { throw unavailable() }
         let destination = target.appendingPathComponent("retrace.db")
         var report = try await measure(destination, command: "restore")
-        guard report.integrity == "ok", report.sha256 == original.sha256,
-              report.sizeBytes == original.sizeBytes, report.frameCount == original.frameCount,
+        guard report.integrity == "ok", report.sha256 == (original.plainSha256 ?? original.sha256),
+              (original.format == "RBC1" || report.sizeBytes == original.sizeBytes), report.frameCount == original.frameCount,
               report.videoCount == original.videoCount else { throw integrityFailure() }
         guard fsync(directory) == 0 else { throw unavailable() }
         complete = true
+        if original.format == "RBC1" {
+            report.format = original.format
+            report.plainSha256 = report.sha256
+            report.sha256 = original.sha256
+            report.sizeBytes = original.sizeBytes
+        }
         report.restoredPath = destination.path
         return report
     }
@@ -151,7 +184,7 @@ enum SnapshotStore {
     /// Other input failures are checked after started so their outcomes are recorded.
     static func validateMetricsSeparation(_ file: URL, state: URL) throws {
         let path = try CLIStateMetrics.canonicalPath(file)
-        for name in ["metrics.db", SyncManifest.filename] {
+        for name in ["metrics.db", SyncManifest.filename, BackupKeyStore.filename] {
             for suffix in ["", "-journal", "-wal", "-shm"] {
                 guard try CLIStateMetrics.canonicalPath(state.appendingPathComponent(name + suffix)) != path else {
                     throw unsafe("unsafe_snapshot")
@@ -204,15 +237,29 @@ enum SnapshotStore {
         }
     }
 
-    private static func measure(_ file: URL, command: String = "snapshot") async throws -> SnapshotReport {
+    private static func measure(_ file: URL, command: String = "snapshot", key: ObjectCrypto.Key? = nil) async throws -> SnapshotReport {
         let before = try await digest(file)
         var report = SnapshotReport(command: command)
         report.sha256 = before.sha256
         report.sizeBytes = before.sizeBytes
+        var plaintext: URL?
+        defer { if let plaintext { try? FileManager.default.removeItem(at: plaintext) } }
+        if try await ObjectCrypto.isEncrypted(file) {
+            report.format = "RBC1"
+            guard let key else { throw CLIError("phrase_required", "Encrypted snapshot requires the recovery phrase on stdin.", exitCode: 2) }
+            // Keep the ciphertext identity available when authentication fails, just
+            // as plaintext verification keeps its digest when SQLite is corrupt.
+            do {
+                let decrypted = try await ObjectCrypto.decryptFile(file, objectKey: objectKey, key: key)
+                plaintext = decrypted
+                report.plainSha256 = try await digest(decrypted).sha256
+            } catch { report.integrity = "failed" }
+        }
         // Keep the byte digest even if SQLite cannot parse a tampered file. Verify
         // must report the SHA mismatch instead of hiding it behind an open error.
         do {
-            let counts = try inspect(file)
+            guard report.integrity != "failed" else { throw integrityFailure() }
+            let counts = try inspect(plaintext ?? file)
             report.integrity = "ok"
             report.frameCount = counts.0
             report.videoCount = counts.1
