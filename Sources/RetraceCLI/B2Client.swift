@@ -2,7 +2,7 @@ import Foundation
 
 enum B2ClientError: Error, Sendable, Equatable {
     case disabled, missingCredentials, expiredToken, badAuthToken, badRequest, retryable
-    case invalidResponse, invalidRequest, paginationLimit, transportFailed
+    case invalidResponse, invalidRequest, paginationLimit, transportFailed, fileNotPresent
     case httpStatus(Int)
 }
 
@@ -11,7 +11,7 @@ struct B2Credentials: Sendable {
     let applicationKey: String
 
     static func fromEnvironment() -> B2Credentials? {
-        // Resolve only on authorize(), never at launch, initialization or dry-run planning.
+        // Resolve only at the runtime sync gate/authorize, never at initialization or dry-run.
         guard let id = getenv("B2_KEY_ID"), let key = getenv("B2_APPLICATION_KEY") else { return nil }
         return B2Credentials(keyID: String(cString: id), applicationKey: String(cString: key))
     }
@@ -52,8 +52,7 @@ struct B2URLSessionTransport: B2Transport {
 
 /// B1 chooses minimal B2 Native REST over an S3 SDK: URLSession already supports the
 /// five needed endpoints and file-backed request bodies; no dependency or app bootstrap.
-/// This shell does not implement retries, upload orchestration, privacy deletion or backup
-/// policy. No CLI path enables it until the privacy/snapshot/encryption contracts are met.
+/// SyncEngine owns upload policy and resume; the client remains disabled by default.
 struct B2Client: Sendable {
     struct Authorization: Decodable, Sendable {
         struct APIInfo: Decodable, Sendable {
@@ -107,12 +106,20 @@ struct B2Client: Sendable {
     private let enabled: Bool
     private let transport: any B2Transport
     private let credentials: @Sendable () -> B2Credentials?
+    private let authorizationURL: URL
 
     init(enabled: Bool = false, transport: (any B2Transport)? = nil,
-         credentials: @escaping @Sendable () -> B2Credentials? = { B2Credentials.fromEnvironment() }) {
+         credentials: @escaping @Sendable () -> B2Credentials? = { B2Credentials.fromEnvironment() },
+         authorizationURL: URL = URL(string: "https://api.backblazeb2.com/b2api/v4/b2_authorize_account")!) {
         self.enabled = enabled
         self.transport = transport ?? B2URLSessionTransport(enabled: enabled)
         self.credentials = credentials
+        self.authorizationURL = authorizationURL
+    }
+
+    func hasCredentials() -> Bool {
+        guard let value = credentials() else { return false }
+        return !value.keyID.isEmpty && !value.applicationKey.isEmpty
     }
 
     func authorize() async throws -> Authorization {
@@ -120,7 +127,8 @@ struct B2Client: Sendable {
         guard let credentials = credentials(), !credentials.keyID.isEmpty, !credentials.applicationKey.isEmpty else {
             throw B2ClientError.missingCredentials
         }
-        var request = URLRequest(url: URL(string: "https://api.backblazeb2.com/b2api/v4/b2_authorize_account")!)
+        try validateURL(authorizationURL)
+        var request = URLRequest(url: authorizationURL)
         request.httpMethod = "GET"
         let basic = Data("\(credentials.keyID):\(credentials.applicationKey)".utf8).base64EncodedString()
         request.setValue("Basic " + basic, forHTTPHeaderField: "Authorization")
@@ -152,15 +160,16 @@ struct B2Client: Sendable {
         return try await send(request, file: file)
     }
 
-    func listFileVersions(authorization: Authorization, bucketID: String, maxPages: Int = 1000) async throws -> [FileVersion] {
+    func listFileVersions(authorization: Authorization, bucketID: String, key: String? = nil, maxPages: Int = 1000) async throws -> [FileVersion] {
         try requireEnabled()
         guard !bucketID.isEmpty, maxPages > 0 else { throw B2ClientError.invalidRequest }
         var body: [String: Any] = ["bucketId": bucketID, "maxFileCount": 1000]
+        if let key { body["prefix"] = key }
         var files: [FileVersion] = []
         var cursors: Set<[String]> = []
         for _ in 0..<maxPages {
             let page: VersionPage = try await send(apiRequest(authorization, endpoint: "b2_list_file_versions", body: body))
-            files.append(contentsOf: page.files)
+            files.append(contentsOf: page.files.filter { key == nil || $0.fileName == key })
             if page.nextFileName == nil, page.nextFileId == nil { return files }
             guard let name = page.nextFileName, let id = page.nextFileId,
                   cursors.insert([name, id]).inserted else { throw B2ClientError.invalidResponse }
@@ -201,6 +210,7 @@ struct B2Client: Sendable {
             case (401, "expired_token"): throw B2ClientError.expiredToken
             case (401, "bad_auth_token"): throw B2ClientError.badAuthToken
             case (400, "bad_request"): throw B2ClientError.badRequest
+            case (400, "file_not_present"), (404, "file_not_present"): throw B2ClientError.fileNotPresent
             case (503, _): throw B2ClientError.retryable
             default: throw B2ClientError.httpStatus(response.statusCode)
             }

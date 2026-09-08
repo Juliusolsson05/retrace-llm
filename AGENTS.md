@@ -59,17 +59,18 @@ retrace/
 │   └── decomposition/           # Staged decomposition docs for large features
 ├── Package.swift                # Swift Package Manager configuration
 ├── Sources/
-│   ├── RetraceCLI/              # Evidence, local sync planning and database recovery executable `retrace-cli`
+│   ├── RetraceCLI/              # Evidence, gated encrypted sync and database recovery executable `retrace-cli`
 │   │   ├── RetraceCLI.swift     # Noninteractive entry point
 │   │   ├── CLICommand.swift     # JSON/JSONL contracts, metrics, evidence/sync/purge/snapshot/verify/restore routing
 │   │   ├── CLIKeyCommand.swift  # Explicit key init/status/rotate/unwrap, stdin recovery and secret-free metrics
 │   │   ├── SourceDatabase.swift # Native schema/aggregate/visible-day purge SELECTs, strict read-only source VFS
 │   │   ├── ChunkInventory.swift # Bounded descriptor-relative metadata inventory
 │   │   ├── CLIStateMetrics.swift # Independent CLI-owned daily_metrics SQLite store
-│   │   ├── B2Client.swift       # Disabled-by-default B2 Native API shell with injectable transport
-│   │   ├── SyncPlanner.swift    # Read-only chunk hashing/revision planning and pending-purge suppression; uploads disabled
+│   │   ├── B2Client.swift       # Disabled-by-default B2 Native API with injectable transport and authorization URL
+│   │   ├── SyncPlanner.swift    # Read-only chunk hashing/revision planning and pending-purge suppression
+│   │   ├── SyncEngine.swift     # Gated encrypted apply, current snapshot lineage, durable upload/deletion retries
 │   │   ├── SnapshotStore.swift  # SQLite online backup, optional RBC1 encryption, dual-hash lineage and empty-target restore
-│   │   └── Tests/RetraceCLITests.swift # Temporary SQLite/FileManager contract fixtures
+│   │   └── Tests/RetraceCLITests.swift # SQLite/FileManager fixtures and offline B2 upload/verify/restore cycles
 │   ├── TestMostRecentFrame/     # Existing diagnostic executable
 │   └── QueryRewindApps/         # Existing Rewind query executable
 ├── scripts/                     # Build/release/validation scripts
@@ -130,7 +131,7 @@ retrace/
 │   ├── VideoEncoder/            # HEVC video encoding
 │   ├── WAL/                     # Write-Ahead Log (WALManager, RecoveryManager)
 │   ├── CloudSync/
-│   │   ├── SyncManifest.swift   # Transactional revisions, deletion ledger and migration-safe dual-hash snapshot lineage
+│   │   ├── SyncManifest.swift   # Transactional revisions, upload attempts, cloud deletion jobs and dual-hash snapshot lineage
 │   │   ├── BackupKeyStore.swift # Wrapped backup keys, Shared recovery phrase codec, explicit rotation archives
 │   │   └── ObjectCrypto.swift   # RBC1 streaming AES-GCM object encryption with authenticated headers/chunks
 │   └── Tests/
@@ -231,7 +232,7 @@ retrace/
 | **SEARCH**     | `Search/`     | `Search/AGENTS.md`     | Query parsing, FTS5 queries, result ranking (no vector search yet) |
 | **MIGRATION**  | `Migration/`  | `Migration/AGENTS.md`  | Import from Rewind AI (Rewind only, others planned)                |
 | **APP**        | `App/`        | —                      | Coordinator, DI container, data adapter, lifecycle management      |
-| **CLI**        | `Sources/RetraceCLI/` | root guide       | Read-only evidence, bounded inventory, sync planning, local snapshot/verify/restore and independent metrics |
+| **CLI**        | `Sources/RetraceCLI/` | root guide       | Read-only evidence, bounded inventory, gated encrypted sync, snapshot/verify/restore and independent metrics |
 | **UI**         | `UI/`         | `UI/AGENTS.md`         | SwiftUI interface (timeline, dashboard, settings, search)          |
 
 **Rule**: Each agent should **ONLY** modify files in their assigned module directory. Cross-module changes require explicit coordination.

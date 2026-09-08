@@ -216,6 +216,97 @@ final class SyncManifestTests: XCTestCase {
         try await reopened.close()
     }
 
+    func testUploadAttemptSurvivesReopenAndRejectsStaleRevisionAndPurgedKey() async throws {
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: source)
+        let row = try await manifest.record(key: "one", sha256: firstHash, sizeBytes: 3, mtimeNs: 1)
+        try await manifest.beginUpload(key: row.key, revision: row.revision, keyID: "fixture", filePath: "/ciphertext",
+            sha1: String(repeating: "a", count: 40), sizeBytes: 88)
+        try await manifest.close()
+        let reopened = try await SyncManifest.open(root: state, sourceRoot: source)
+        let uploading = try await reopened.lookup(key: "one")
+        XCTAssertEqual(uploading?.uploadState, .uploading)
+        let pending = try await reopened.listPending()
+        XCTAssertEqual(pending.map(\.key), ["one"])
+        let attempt = try await reopened.uploadAttempt(key: "one")
+        XCTAssertEqual(attempt?.filePath, "/ciphertext")
+        XCTAssertEqual(attempt?.sha1, String(repeating: "a", count: 40))
+        _ = try await reopened.record(key: "one", sha256: secondHash, sizeBytes: 3, mtimeNs: 2)
+        let stale = try await reopened.uploadAttempt(key: "one")
+        XCTAssertNil(stale)
+        do {
+            try await reopened.beginUpload(key: "one", revision: 1, keyID: "fixture", filePath: "/ciphertext", sha1: String(repeating: "a", count: 40), sizeBytes: 88)
+            XCTFail("Stale upload accepted")
+        } catch { XCTAssertEqual(error as? SyncManifestError, .staleRevision) }
+        _ = try await reopened.recordPendingDeletions(keys: ["one"], reason: "fixture")
+        do {
+            try await reopened.beginUpload(key: "one", revision: 2, keyID: "fixture", filePath: "/ciphertext", sha1: String(repeating: "a", count: 40), sizeBytes: 88)
+            XCTFail("Purged upload accepted")
+        } catch { XCTAssertEqual(error as? SyncManifestError, .pendingDeletion) }
+        try await reopened.close()
+    }
+
+    func testCloudDeletionQueuePersistsVersionsAndAcknowledgesOnlyExactBucketVersion() async throws {
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: source)
+        for bucket in ["first", "second"] {
+            try await manifest.queueCloudDeletion(bucketID: bucket, key: "one", fileID: "v1")
+            try await manifest.queueCloudDeletion(bucketID: bucket, key: "one", fileID: "v1")
+        }
+        try await manifest.queueCloudDeletion(bucketID: "first", key: "one", fileID: "v2")
+        try await manifest.close()
+        let reopened = try await SyncManifest.open(root: state, sourceRoot: source)
+        let first = try await reopened.pendingCloudDeletions(bucketID: "first")
+        XCTAssertEqual(Set(first.map(\.fileID)), ["v1", "v2"])
+        try await reopened.acknowledgeCloudDeletion(bucketID: "first", key: "one", fileID: "v1")
+        let remaining = try await reopened.pendingCloudDeletions(bucketID: "first")
+        XCTAssertEqual(remaining.map(\.fileID), ["v2"])
+        let other = try await reopened.pendingCloudDeletions(bucketID: "second")
+        XCTAssertEqual(other.map(\.fileID), ["v1"])
+        try await reopened.close()
+    }
+
+    func testMissingDurableTransferTablesFailClosedInsteadOfErasingResumeState() async throws {
+        for table in ["upload_attempts", "cloud_deletions"] {
+            let location = sandbox.appendingPathComponent(table)
+            let manifest = try await SyncManifest.open(root: location, sourceRoot: source)
+            try await manifest.close()
+            let file = location.appendingPathComponent(SyncManifest.filename)
+            var db: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(file.path, &db), SQLITE_OK)
+            XCTAssertEqual(sqlite3_exec(db, "DROP TABLE \(table)", nil, nil, nil), SQLITE_OK)
+            XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+            let before = try Data(contentsOf: file)
+            do {
+                let reopened = try await SyncManifest.open(root: location, sourceRoot: source)
+                try await reopened.close()
+                XCTFail("Missing durable \(table) was silently recreated")
+            } catch { XCTAssertEqual(error as? SyncManifestError, .unavailable) }
+            XCTAssertEqual(try Data(contentsOf: file), before)
+        }
+    }
+
+    func testLegacyPendingUploadedConstraintMigratesToDurableUploadingState() async throws {
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(state.appendingPathComponent(SyncManifest.filename).path, &db), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, """
+            CREATE TABLE objects(key TEXT PRIMARY KEY NOT NULL,sha256 TEXT NOT NULL,sizeBytes INTEGER NOT NULL,
+                mtimeNs INTEGER NOT NULL,revision INTEGER NOT NULL,
+                uploadState TEXT NOT NULL CHECK(uploadState IN ('pending','uploaded')),uploadedAt INTEGER,contentTag TEXT);
+            INSERT INTO objects VALUES('one','\(firstHash)',3,1,1,'uploaded',2,'old-version');
+            """, nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: source)
+        let old = try await manifest.lookup(key: "one")
+        XCTAssertEqual(old?.contentTag, "old-version")
+        _ = try await manifest.record(key: "one", sha256: secondHash, sizeBytes: 3, mtimeNs: 2)
+        try await manifest.beginUpload(key: "one", revision: 2, keyID: "fixture", filePath: "/ciphertext",
+            sha1: String(repeating: "a", count: 40), sizeBytes: 88)
+        let changed = try await manifest.lookup(key: "one")
+        XCTAssertEqual(changed?.uploadState, .uploading)
+        XCTAssertEqual(changed?.revision, 2)
+        try await manifest.close()
+    }
+
     func testHashChangesAndExplicitRevisionInvalidateUploadAcknowledgement() async throws {
         let manifest = try await SyncManifest.open(root: state, sourceRoot: source)
         let entry = try await manifest.record(key: "chunks/202609/08/1", sha256: firstHash, sizeBytes: 3, mtimeNs: 1)

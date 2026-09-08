@@ -110,6 +110,12 @@ struct SyncPlan: Encodable, Sendable {
     var errors: [String: Int] = [:]
     var elapsedMs: Double = 0
     var error: CLIError?
+    var snapshot: SnapshotReport?
+    var lineageTag: String?
+    var bytesUploaded: Int64 = 0
+    var objectsUploaded = 0
+    var uploadsSkipped = 0
+    var deletes = 0
 }
 
 enum SyncPlanner {

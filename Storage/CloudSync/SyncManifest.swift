@@ -11,7 +11,20 @@ public enum SyncManifestError: Error, Sendable, Equatable {
 public actor SyncManifest {
     public static let filename = "sync-manifest.db"
 
-    public enum UploadState: String, Sendable { case pending, uploaded }
+    public enum UploadState: String, Sendable { case pending, uploading, uploaded }
+
+    public struct UploadAttempt: Sendable {
+        public let revision: Int64
+        public let keyID: String
+        public let filePath: String
+        public let sha1: String
+        public let sizeBytes: Int64
+    }
+
+    public struct CloudDeletion: Sendable {
+        public let key: String
+        public let fileID: String
+    }
 
     public struct Object: Sendable, Equatable {
         public let key: String
@@ -100,7 +113,7 @@ public actor SyncManifest {
                         sizeBytes INTEGER NOT NULL CHECK(sizeBytes >= 0),
                         mtimeNs INTEGER NOT NULL,
                         revision INTEGER NOT NULL CHECK(revision > 0),
-                        uploadState TEXT NOT NULL CHECK(uploadState IN ('pending','uploaded')),
+                        uploadState TEXT NOT NULL CHECK(uploadState IN ('pending','uploading','uploaded')),
                         uploadedAt INTEGER,
                         contentTag TEXT
                     );
@@ -123,7 +136,39 @@ public actor SyncManifest {
                         appliedLocal INTEGER NOT NULL DEFAULT 0,
                         PRIMARY KEY(objectKey, deletedAtMs)
                     );
-                    PRAGMA user_version=1;
+                    """)
+                // SQLite cannot alter a CHECK constraint. Rebuild only the legacy
+                // objects table, inside this same migration transaction.
+                var schema: OpaquePointer?
+                try Self.prepare(handle, "SELECT sql FROM sqlite_master WHERE name='objects'", &schema)
+                guard sqlite3_step(schema) == SQLITE_ROW, let sql = sqlite3_column_text(schema, 0) else {
+                    sqlite3_finalize(schema)
+                    throw SyncManifestError.unavailable
+                }
+                let supportsUploading = String(cString: sql).contains("'uploading'")
+                sqlite3_finalize(schema)
+                if !supportsUploading {
+                    try Self.execute(handle, """
+                        ALTER TABLE objects RENAME TO objects_legacy;
+                        CREATE TABLE objects (
+                            key TEXT PRIMARY KEY NOT NULL, sha256 TEXT NOT NULL CHECK(length(sha256)=64),
+                            sizeBytes INTEGER NOT NULL CHECK(sizeBytes>=0), mtimeNs INTEGER NOT NULL,
+                            revision INTEGER NOT NULL CHECK(revision>0),
+                            uploadState TEXT NOT NULL CHECK(uploadState IN ('pending','uploading','uploaded')),
+                            uploadedAt INTEGER, contentTag TEXT);
+                        INSERT INTO objects SELECT key,sha256,sizeBytes,mtimeNs,revision,uploadState,uploadedAt,contentTag FROM objects_legacy;
+                        DROP TABLE objects_legacy;
+                        """)
+                }
+                try Self.execute(handle, """
+                    CREATE TABLE IF NOT EXISTS upload_attempts (
+                        objectKey TEXT PRIMARY KEY NOT NULL, revision INTEGER NOT NULL,
+                        keyID TEXT NOT NULL, filePath TEXT NOT NULL, sha1 TEXT NOT NULL CHECK(length(sha1)=40),
+                        sizeBytes INTEGER NOT NULL CHECK(sizeBytes>0));
+                    CREATE TABLE IF NOT EXISTS cloud_deletions (
+                        bucketID TEXT NOT NULL, objectKey TEXT NOT NULL, fileID TEXT NOT NULL,
+                        PRIMARY KEY(bucketID,objectKey,fileID));
+                    PRAGMA user_version=2;
                     """)
                 if try !Self.hasPlainSnapshotHash(handle) {
                     try Self.execute(handle, "ALTER TABLE snapshots ADD COLUMN plainSha256 TEXT CHECK(plainSha256 IS NULL OR length(plainSha256)=64);")
@@ -165,7 +210,7 @@ public actor SyncManifest {
         // Select queue eligibility in one SQLite snapshot, including purges from
         // other processes. Keep object history without exposing it as queued work.
         let suppression = hasLedger ? " AND NOT EXISTS (SELECT 1 FROM deletions d WHERE d.objectKey=objects.key)" : ""
-        return try rows(sql: "SELECT key,sha256,sizeBytes,mtimeNs,revision,uploadState,uploadedAt,contentTag FROM objects WHERE uploadState='pending'"
+        return try rows(sql: "SELECT key,sha256,sizeBytes,mtimeNs,revision,uploadState,uploadedAt,contentTag FROM objects WHERE uploadState IN ('pending','uploading')"
                         + suppression + " ORDER BY key")
     }
 
@@ -210,8 +255,8 @@ public actor SyncManifest {
         }
     }
 
-    /// appliedLocal describes only app retention. Until cloud all-version deletion
-    /// is implemented, EVERY ledger key remains suppressed, including local applies.
+    /// Deletion intent is permanent suppression, even after all cloud versions are
+    /// gone: otherwise a locally retained chunk would be uploaded on the next run.
     public func pendingDeletionKeys() throws -> Set<String> {
         try deletionKeys(reason: nil)
     }
@@ -401,6 +446,96 @@ public actor SyncManifest {
         }
     }
 
+    /// Persist the exact randomized ciphertext before the provider can see it. A
+    /// lost upload response must retry these bytes, not encrypt with fresh nonces.
+    public func beginUpload(key: String, revision: Int64, keyID: String, filePath: String,
+                            sha1: String, sizeBytes: Int64) throws {
+        try transaction { db in
+            guard try !isPendingDeletion(key: key) else { throw SyncManifestError.pendingDeletion }
+            guard let row = try lookup(key: key) else { throw SyncManifestError.missingObject }
+            guard row.revision == revision else { throw SyncManifestError.staleRevision }
+            guard !keyID.isEmpty, !keyID.contains("\0"), filePath.hasPrefix("/"), !filePath.contains("\0"),
+                  sizeBytes > 0, sha1.utf8.count == 40,
+                  sha1.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { throw SyncManifestError.invalidRecord }
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            try Self.prepare(db, "INSERT OR REPLACE INTO upload_attempts VALUES(?,?,?,?,?,?)", &statement)
+            try Self.bind(key, to: statement, at: 1)
+            sqlite3_bind_int64(statement, 2, revision)
+            try Self.bind(keyID, to: statement, at: 3)
+            try Self.bind(filePath, to: statement, at: 4)
+            try Self.bind(sha1, to: statement, at: 5)
+            sqlite3_bind_int64(statement, 6, sizeBytes)
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+            var update: OpaquePointer?
+            defer { sqlite3_finalize(update) }
+            try Self.prepare(db, "UPDATE objects SET uploadState='uploading',uploadedAt=NULL,contentTag=NULL WHERE key=?", &update)
+            try Self.bind(key, to: update, at: 1)
+            guard sqlite3_step(update) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+        }
+    }
+
+    public func uploadAttempt(key: String) throws -> UploadAttempt? {
+        guard !isClosed else { throw SyncManifestError.closed }
+        guard let db else { return nil }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        try Self.prepare(db, """
+            SELECT a.revision,a.keyID,a.filePath,a.sha1,a.sizeBytes FROM upload_attempts a
+            JOIN objects o ON o.key=a.objectKey AND o.revision=a.revision WHERE a.objectKey=?
+            """, &statement)
+        try Self.bind(key, to: statement, at: 1)
+        let status = sqlite3_step(statement)
+        if status == SQLITE_DONE { return nil }
+        guard status == SQLITE_ROW else { throw SyncManifestError.unavailable }
+        func text(_ column: Int32) throws -> String {
+            guard let bytes = sqlite3_column_text(statement, column) else { throw SyncManifestError.unavailable }
+            return String(cString: bytes)
+        }
+        return UploadAttempt(revision: sqlite3_column_int64(statement, 0), keyID: try text(1),
+            filePath: try text(2), sha1: try text(3), sizeBytes: sqlite3_column_int64(statement, 4))
+    }
+
+    /// Separate from the permanent privacy ledger: these are exact provider-version
+    /// jobs, also used to retire replaced revisions. Acknowledgement only removes a job.
+    public func queueCloudDeletion(bucketID: String, key: String, fileID: String) throws {
+        try changeCloudDeletion(sql: "INSERT OR IGNORE INTO cloud_deletions(bucketID,objectKey,fileID) VALUES(?,?,?)",
+            bucketID: bucketID, key: key, fileID: fileID)
+    }
+
+    public func acknowledgeCloudDeletion(bucketID: String, key: String, fileID: String) throws {
+        try changeCloudDeletion(sql: "DELETE FROM cloud_deletions WHERE bucketID=? AND objectKey=? AND fileID=?",
+            bucketID: bucketID, key: key, fileID: fileID)
+    }
+
+    private func changeCloudDeletion(sql: String, bucketID: String, key: String, fileID: String) throws {
+        try transaction { db in
+            guard [bucketID, key, fileID].allSatisfy({ !$0.isEmpty && !$0.contains("\0") }) else { throw SyncManifestError.invalidRecord }
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            try Self.prepare(db, sql, &statement)
+            for (index, value) in [bucketID, key, fileID].enumerated() { try Self.bind(value, to: statement, at: Int32(index + 1)) }
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+        }
+    }
+
+    public func pendingCloudDeletions(bucketID: String) throws -> [CloudDeletion] {
+        guard !isClosed else { throw SyncManifestError.closed }
+        guard let db else { return [] }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        try Self.prepare(db, "SELECT objectKey,fileID FROM cloud_deletions WHERE bucketID=? ORDER BY objectKey,fileID", &statement)
+        try Self.bind(bucketID, to: statement, at: 1)
+        var result: [CloudDeletion] = []
+        while true {
+            let status = sqlite3_step(statement)
+            if status == SQLITE_DONE { return result }
+            guard status == SQLITE_ROW, let key = sqlite3_column_text(statement, 0),
+                  let id = sqlite3_column_text(statement, 1) else { throw SyncManifestError.unavailable }
+            result.append(CloudDeletion(key: String(cString: key), fileID: String(cString: id)))
+        }
+    }
+
     private func transaction<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
         guard !isClosed else { throw SyncManifestError.closed }
         guard !readOnly else { throw SyncManifestError.readOnly }
@@ -451,7 +586,20 @@ public actor SyncManifest {
         try prepare(db, "PRAGMA user_version", &version)
         guard sqlite3_step(version) == SQLITE_ROW else { throw SyncManifestError.unavailable }
         let schemaVersion = sqlite3_column_int(version, 0)
-        guard (0...1).contains(schemaVersion), sqlite3_step(version) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+        guard (0...2).contains(schemaVersion), sqlite3_step(version) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+        if schemaVersion >= 2 {
+            // Never recreate a lost durable queue in an already migrated store.
+            // Doing so could duplicate a committed upload or forget a cloud purge.
+            for sql in [
+                "SELECT objectKey,revision,keyID,filePath,sha1,sizeBytes FROM upload_attempts LIMIT 0",
+                "SELECT bucketID,objectKey,fileID FROM cloud_deletions LIMIT 0"
+            ] {
+                var statement: OpaquePointer?
+                defer { sqlite3_finalize(statement) }
+                try prepare(db, sql, &statement)
+                guard sqlite3_step(statement) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+            }
+        }
         var table: OpaquePointer?
         defer { sqlite3_finalize(table) }
         try prepare(db, "SELECT type FROM sqlite_master WHERE name='deletions'", &table)

@@ -34,9 +34,10 @@ struct SnapshotReport: Encodable, Sendable {
 enum SnapshotStore {
     // Logical identity is independent of local placement so copied/moved containers
     // remain recoverable without the original manifest. Content identity is SHA256.
-    private static let objectKey = "snapshots/database"
+    static let objectKey = "snapshots/database"
 
-    static func create(root: URL, state: URL, key: ObjectCrypto.Key? = nil) async throws -> SnapshotReport {
+    static func create(root: URL, state: URL, key: ObjectCrypto.Key? = nil,
+                       lineageTag: String? = nil, copying verified: URL? = nil) async throws -> SnapshotReport {
         let directoryURL = state.appendingPathComponent("snapshots", isDirectory: true)
         try outsideSource(directoryURL, root: root, code: "unsafe_state_root")
         let directory = try openDirectory(directoryURL, create: true, code: "unsafe_state_root")
@@ -46,7 +47,7 @@ enum SnapshotStore {
         // being overwritten. Collisions keep the required numeric UTC-ms filename.
         var name: String?
         for offset in 0..<1000 {
-            let candidate = "\(createdMs + Int64(offset)).db"
+            let candidate = "\(createdMs + Int64(offset)).db" + (lineageTag != nil && key != nil ? ".rbc1" : "")
             let fd = openat(directory, candidate, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
             if fd >= 0 { close(fd); name = candidate; break }
             guard errno == EEXIST else { throw unavailable() }
@@ -55,7 +56,14 @@ enum SnapshotStore {
         let file = directoryURL.appendingPathComponent(name)
         var complete = false
         defer { if !complete { removeDatabase(directory: directory, name: name) } }
-        try backup(root: root, destination: file)
+        if let verified {
+            try validateInput(verified, root: root)
+            let output = open(file.path, O_WRONLY | O_NOFOLLOW | O_CLOEXEC)
+            guard output >= 0 else { throw unavailable() }
+            defer { close(output) }
+            try copy(verified, to: output)
+            guard fsync(output) == 0 else { throw unavailable() }
+        } else { try backup(root: root, destination: file) }
         var measurement = try await measure(file)
         guard measurement.integrity == "ok", let frames = measurement.frameCount,
               let videos = measurement.videoCount else { throw integrityFailure() }
@@ -77,7 +85,7 @@ enum SnapshotStore {
         do {
             row = try await manifest.recordSnapshot(createdMs: createdMs, sizeBytes: measurement.sizeBytes!,
                 sha256: measurement.sha256!, frameCount: frames, videoCount: videos,
-                lineageTag: key == nil ? "sqlite-online-backup-v1" : "sqlite-online-backup-rbc1-v1",
+                lineageTag: lineageTag ?? (key == nil ? "sqlite-online-backup-v1" : "sqlite-online-backup-rbc1-v1"),
                 snapshotPath: file.path, plainSha256: measurement.plainSha256)
             try await manifest.close()
         } catch {

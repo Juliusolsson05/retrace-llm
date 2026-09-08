@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import CryptoKit
 import SQLCipher
 import Shared
 import Storage
@@ -438,6 +439,274 @@ final class RetraceCLITests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: state.path))
     }
 
+    func testSyncApplyReportsEveryMissingGateWithoutNetwork() async throws {
+        let transport = B2StubTransport(objectStore: true)
+        let result = await applySync(transport, phrase: nil, credentials: false)
+        XCTAssertEqual(result.exitCode, 6)
+        try assertError(result, "sync_gate_missing")
+        let error = try XCTUnwrap(try json(result)["error"] as? [String: Any])
+        let gates = Set(try XCTUnwrap(error["missingGates"] as? [String]))
+        XCTAssertTrue(gates.isSuperset(of: ["backup_key_missing", "phrase_required", "b2_credentials_missing", "snapshot_current_missing"]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: database.path))
+        let requests = await transport.requests
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    private func applySync(_ transport: B2StubTransport, phrase: String?, credentials: Bool = true,
+                           extra: [String] = []) async -> CLIResult {
+        let client = B2Client(enabled: true, transport: transport, credentials: {
+            credentials ? B2Credentials(keyID: "fixture-id", applicationKey: "fixture-secret") : nil
+        }, authorizationURL: URL(string: "https://api.example.test/b2api/v4/b2_authorize_account")!)
+        return await CLICommand.run(arguments: ["sync", "--apply", "--storage-root", root.path,
+            "--state-root", state.path] + (phrase == nil ? [] : ["--phrase-from-stdin"]) + extra,
+            readPhrase: { phrase ?? "" }, b2Client: client)
+    }
+
+    private func syncFixture() async throws -> String {
+        try await initialize(seed: true)
+        for (name, bytes) in [("1", Data("first chunk".utf8)), ("2", Data(repeating: 91, count: 1_048_589))] {
+            let file = root.appendingPathComponent("chunks/202609/08/" + name)
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try bytes.write(to: file)
+        }
+        return try await BackupKeyStore.initialize(root: state, sourceRoot: root).recoveryPhrase
+    }
+
+    func testSyncApplyEncryptedObjectsSnapshotLineageVerifyAndRestoreCycle() async throws {
+        let phrase = try await syncFixture()
+        let before = try sourceFingerprint()
+        let transport = B2StubTransport(objectStore: true)
+        let plan = try json(await run("sync", extra: ["--dry-run"]))
+        XCTAssertEqual((plan["wouldUpload"] as? [Any])?.count, 2)
+        let result = await applySync(transport, phrase: phrase)
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        let report = try json(result)
+        let objects = await transport.objects
+        XCTAssertEqual(objects.count, 3)
+        let snapshotKey = try XCTUnwrap(objects.keys.first { $0.hasPrefix("snapshots/") })
+        XCTAssertNotNil(snapshotKey.range(of: #"^snapshots/[0-9]+\.db\.rbc1$"#, options: .regularExpression))
+        let key = try await BackupKeyStore.unwrap(root: state, sourceRoot: root, phrase: phrase)
+        var uploadedBytes = 0
+        for (name, versions) in objects {
+            let stored = try XCTUnwrap(versions.first)
+            XCTAssertEqual(versions.count, 1)
+            uploadedBytes += stored.bytes.count
+            XCTAssertEqual(stored.bytes.prefix(4), Data("RBC1".utf8))
+            let download = sandbox.appendingPathComponent(UUID().uuidString)
+            try stored.bytes.write(to: download)
+            if name.hasPrefix("chunks/") {
+                let plaintext = try Data(contentsOf: root.appendingPathComponent(name))
+                XCTAssertNotEqual(stored.bytes, plaintext)
+                let decoded = try await ObjectCrypto.decryptFile(download, objectKey: name, key: key)
+                defer { try? FileManager.default.removeItem(at: decoded) }
+                XCTAssertEqual(try Data(contentsOf: decoded), plaintext)
+            } else {
+                XCTAssertNotEqual(stored.bytes, try Data(contentsOf: database))
+                let verified = await phraseCommand("verify", phrase: phrase, extra: ["--snapshot", download.path])
+                XCTAssertEqual(verified.exitCode, 0, verified.stderr)
+                let target = sandbox.appendingPathComponent("cloud-restored")
+                let restored = await phraseCommand("restore", phrase: phrase, extra: ["--snapshot", download.path, "--to", target.path])
+                XCTAssertEqual(restored.exitCode, 0, restored.stderr)
+                try snapshotReadCounts(target.appendingPathComponent("retrace.db"), frames: 2, videos: 1)
+            }
+        }
+        let snapshot = try XCTUnwrap(report["snapshot"] as? [String: Any])
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: root, readOnly: true)
+        let row = try await manifest.lookupSnapshot(sha256: XCTUnwrap(snapshot["sha256"] as? String),
+            snapshotPath: XCTUnwrap(snapshot["snapshotPath"] as? String))
+        XCTAssertEqual(row?.lineageTag, report["lineageTag"] as? String)
+        XCTAssertNotNil(row?.plainSha256)
+        try await manifest.close()
+        XCTAssertEqual(report["objectsUploaded"] as? Int, 3)
+        XCTAssertEqual(report["bytesUploaded"] as? Int, uploadedBytes)
+        XCTAssertEqual(try stateScalar("SELECT count(*) FROM objects WHERE uploadState='uploaded'"), 3)
+        XCTAssertEqual(try sourceFingerprint(), before)
+        let metadata = try syncOutcomeMetric()
+        XCTAssertEqual(metadata["objectsUploaded"] as? Int, 3)
+        XCTAssertEqual(metadata["bytesUploaded"] as? Int, uploadedBytes)
+        XCTAssertEqual(metadata["deletes"] as? Int, 0)
+        XCTAssertEqual(metadata["suppressedCount"] as? Int, 0)
+        XCTAssertFalse(String(describing: metadata).contains(phrase))
+        XCTAssertFalse(String(describing: metadata).contains("fixture-secret"))
+    }
+
+    private func syncOutcomeMetric() throws -> [String: Any] {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(state.appendingPathComponent("metrics.db").path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT metadata FROM daily_metrics ORDER BY id DESC", -1, &stmt, nil), SQLITE_OK)
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let bytes = Data(String(cString: try XCTUnwrap(sqlite3_column_text(stmt, 0))).utf8)
+            let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+            if metadata["command"] as? String == "sync" { return metadata }
+        }
+        XCTFail("No sync outcome metric")
+        return [:]
+    }
+
+    func testSyncApplyLostUploadResponseResumesSameCiphertextWithoutDuplicateVersions() async throws {
+        let phrase = try await syncFixture()
+        let transport = B2StubTransport(objectStore: true, loseUploadResponseFor: "chunks/202609/08/1")
+        let failed = await applySync(transport, phrase: phrase)
+        XCTAssertNotEqual(failed.exitCode, 0)
+        XCTAssertEqual(try stateScalar("SELECT count(*) FROM objects WHERE uploadState='uploading'"), 1)
+        let firstObjects = await transport.objects
+        let snapshotPath = try XCTUnwrap((try json(failed)["snapshot"] as? [String: Any])?["snapshotPath"] as? String)
+        let resumed = await applySync(transport, phrase: phrase, extra: ["--snapshot-current", snapshotPath])
+        XCTAssertEqual(resumed.exitCode, 0, resumed.stderr)
+        let objects = await transport.objects
+        XCTAssertEqual(objects.count, 3)
+        XCTAssertTrue(objects.values.allSatisfy { $0.count == 1 })
+        XCTAssertEqual(objects["chunks/202609/08/1"]?.first?.bytes, firstObjects["chunks/202609/08/1"]?.first?.bytes)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(try json(resumed)["uploadsSkipped"] as? Int), 1)
+        XCTAssertEqual(try stateScalar("SELECT count(*) FROM objects WHERE uploadState='uploaded'"), 3)
+        let requests = await transport.requests
+        XCTAssertEqual(requests.filter { $0.request.value(forHTTPHeaderField: "X-Bz-File-Name") == "chunks/202609/08/1" }.count, 1)
+    }
+
+    func testSyncApplyModifiedChunkAdvancesRevisionAndDeletesOldVersionAfterRetry() async throws {
+        let phrase = try await syncFixture()
+        let transport = B2StubTransport(objectStore: true)
+        let first = await applySync(transport, phrase: phrase)
+        XCTAssertEqual(first.exitCode, 0, first.stderr)
+        let key = "chunks/202609/08/1"
+        let previous = await transport.objects[key]?.first?.id
+        try Data("changed chunk".utf8).write(to: root.appendingPathComponent(key))
+        await transport.failNextDelete()
+        let failed = await applySync(transport, phrase: phrase)
+        XCTAssertNotEqual(failed.exitCode, 0)
+        XCTAssertEqual(try stateScalar("SELECT revision FROM objects WHERE key='\(key)'"), 2)
+        XCTAssertEqual(try stateScalar("SELECT count(*) FROM cloud_deletions"), 1)
+        let resumed = await applySync(transport, phrase: phrase)
+        XCTAssertEqual(resumed.exitCode, 0, resumed.stderr)
+        let versions = await transport.objects[key]
+        XCTAssertEqual(versions?.count, 1)
+        XCTAssertNotEqual(versions?.first?.id, previous)
+        XCTAssertEqual(try stateScalar("SELECT revision FROM objects WHERE key='\(key)'"), 2)
+        XCTAssertEqual(try stateScalar("SELECT count(*) FROM cloud_deletions"), 0)
+    }
+
+    func testSyncApplyDefaultRetryKeepsOneCloudVersionPerCommittedChunk() async throws {
+        let phrase = try await syncFixture()
+        let transport = B2StubTransport(objectStore: true, loseUploadResponseFor: "chunks/202609/08/2")
+        let first = await applySync(transport, phrase: phrase)
+        XCTAssertNotEqual(first.exitCode, 0)
+        let retried = await applySync(transport, phrase: phrase)
+        XCTAssertEqual(retried.exitCode, 0, retried.stderr)
+        let objects = await transport.objects
+        XCTAssertEqual(objects["chunks/202609/08/1"]?.count, 1)
+        XCTAssertEqual(objects["chunks/202609/08/2"]?.count, 1)
+        XCTAssertEqual(try json(retried)["uploadsSkipped"] as? Int, 1)
+        // Each implicit apply deliberately makes a current DB recovery point.
+        XCTAssertEqual(objects.keys.filter { $0.hasPrefix("snapshots/") }.count, 2)
+    }
+
+    func testSyncApplyPurgedDaySuppressesUploadsAndDeletesEveryPriorCloudVersion() async throws {
+        let keys = try await initializePurgeEvidence()
+        let phrase = try await BackupKeyStore.initialize(root: state, sourceRoot: root).recoveryPhrase
+        let transport = B2StubTransport(objectStore: true)
+        let first = await applySync(transport, phrase: phrase)
+        XCTAssertEqual(first.exitCode, 0, first.stderr)
+        for key in keys { await transport.seed(key: key, bytes: Data("older cloud version".utf8)) }
+        let purged = await run("sync-plan", extra: ["--purge-day", exportDay])
+        XCTAssertEqual(purged.exitCode, 0, purged.stderr)
+        _ = await run("purge-apply", extra: ["--day", exportDay])
+        // Cloud deletion must still happen after local files are gone.
+        try FileManager.default.removeItem(at: root.appendingPathComponent(keys[0]))
+        let result = await applySync(transport, phrase: phrase)
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        let objects = await transport.objects
+        for key in keys { XCTAssertTrue(objects[key, default: []].isEmpty) }
+        XCTAssertEqual(try json(result)["deletes"] as? Int, 4)
+        XCTAssertEqual(try json(result)["suppressedPendingPurges"] as? Int, 1)
+        XCTAssertEqual(try stateScalar("SELECT count(*) FROM deletions"), 2)
+        let again = await applySync(transport, phrase: phrase)
+        XCTAssertEqual(again.exitCode, 0, again.stderr)
+        XCTAssertEqual(try json(again)["deletes"] as? Int, 0)
+        XCTAssertEqual(try json(again)["suppressedPendingPurges"] as? Int, 1)
+    }
+
+    func testSyncApplyDistinctPhraseCredentialsSnapshotAndLedgerGateErrors() async throws {
+        let phrase = try await syncFixture()
+        let transport = B2StubTransport(objectStore: true)
+        for (supplied, creds, extra, expected) in [
+            (nil as String?, true, [String](), "phrase_required"),
+            ("bad phrase", true, [], "backup_key_unlock_failed"),
+            (phrase, false, [], "b2_credentials_missing"),
+            (phrase, true, ["--snapshot-current", sandbox.appendingPathComponent("missing.db").path], "snapshot_current_missing")
+        ] {
+            let result = await applySync(transport, phrase: supplied, credentials: creds, extra: extra)
+            XCTAssertEqual(result.exitCode, 6, result.stderr)
+            let error = try XCTUnwrap(try json(result)["error"] as? [String: Any])
+            XCTAssertEqual(error["code"] as? String, "sync_gate_missing")
+            XCTAssertTrue((error["missingGates"] as? [String])?.contains(expected) == true)
+        }
+        let requests = await transport.requests
+        XCTAssertTrue(requests.isEmpty)
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: root)
+        try await manifest.close()
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(state.appendingPathComponent(SyncManifest.filename).path, &db), SQLITE_OK)
+        try exec(XCTUnwrap(db), "DROP TABLE deletions")
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let broken = await applySync(transport, phrase: phrase)
+        XCTAssertEqual(broken.exitCode, 6)
+        let gates = (try json(broken)["error"] as? [String: Any])?["missingGates"] as? [String]
+        XCTAssertTrue(gates?.contains("deletion_ledger_unavailable") == true)
+        let after = await transport.requests
+        XCTAssertTrue(after.isEmpty)
+    }
+
+    func testSyncApplyDryRunDoesNotReadPhraseCredentialsOrCreateSnapshot() async throws {
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let transport = B2StubTransport(objectStore: true)
+        let client = B2Client(enabled: true, transport: transport, credentials: { XCTFail("Dry run read credentials"); return nil })
+        let result = await CLICommand.run(arguments: ["sync", "--apply", "--dry-run", "--phrase-from-stdin",
+            "--storage-root", root.path, "--state-root", state.path], readPhrase: { XCTFail("Dry run read stdin"); return "" }, b2Client: client)
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.appendingPathComponent(SyncManifest.filename).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.appendingPathComponent("snapshots").path))
+        let requests = await transport.requests
+        XCTAssertTrue(requests.isEmpty)
+        let plain = await run("sync")
+        XCTAssertEqual(plain.exitCode, 6)
+        try assertError(plain, "upload_disabled")
+        XCTAssertNotNil((try json(plain)["error"] as? [String: Any])?["missingGates"])
+    }
+
+    func testSyncApplyRejectsLineageChangedAfterAuthorization() async throws {
+        let phrase = try await syncFixture()
+        let path = state.appendingPathComponent(SyncManifest.filename).path
+        let transport = B2StubTransport(objectStore: true, onAuthorize: {
+            var db: OpaquePointer?
+            guard sqlite3_open(path, &db) == SQLITE_OK else { throw B2ClientError.transportFailed }
+            defer { sqlite3_close(db) }
+            XCTAssertEqual(sqlite3_exec(db, "UPDATE snapshots SET lineageTag='older-run'", nil, nil, nil), SQLITE_OK)
+        })
+        let result = await applySync(transport, phrase: phrase)
+        XCTAssertEqual(result.exitCode, 6, result.stderr)
+        let missing = (try json(result)["error"] as? [String: Any])?["missingGates"] as? [String]
+        XCTAssertEqual(missing, ["snapshot_current_missing"])
+        let objects = await transport.objects
+        XCTAssertTrue(objects.isEmpty)
+    }
+
+    func testSyncApplyExplicitPlaintextSnapshotIsSealedWithFreshLineage() async throws {
+        let phrase = try await syncFixture()
+        let (file, original) = try await snapshot()
+        let transport = B2StubTransport(objectStore: true)
+        let result = await applySync(transport, phrase: phrase, extra: ["--snapshot-current", file.path])
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        let report = try XCTUnwrap(try json(result)["snapshot"] as? [String: Any])
+        XCTAssertEqual(report["plainSha256"] as? String, original["sha256"] as? String)
+        XCTAssertEqual(report["format"] as? String, "RBC1")
+        XCTAssertNotEqual(report["lineageId"] as? Int, original["lineageId"] as? Int)
+        let verified = await phraseCommand("verify", phrase: phrase, extra: ["--snapshot", try XCTUnwrap(report["snapshotPath"] as? String)])
+        XCTAssertEqual(verified.exitCode, 0, verified.stderr)
+    }
+
     func testStreamingHasherKnownVectorsAcrossOneMiBBoundary() async throws {
         let vectors: [(Data, String, String)] = [
             (Data(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "da39a3ee5e6b4b0d3255bfef95601890afd80709"),
@@ -815,7 +1084,7 @@ final class RetraceCLITests: XCTestCase {
             (200, #"{"bucketId":"bucket","uploadUrl":"https://upload.example.test/b2api/v4/b2_upload_file","authorizationToken":"upload-token"}"#),
             (200, Self.fileJSON)
         ])
-        let client = B2Client(enabled: true, transport: transport, credentials: { B2Credentials(keyID: "fixture-id", applicationKey: "fixture-key") })
+        let client = B2Client(enabled: true, transport: transport, credentials: { B2Credentials(keyID: "fixture-id", applicationKey: "fixture-key") }, authorizationURL: Self.stubAuthorizationURL)
         let authorization = try await client.authorize()
         XCTAssertEqual(authorization.accountId, "account")
         let upload = try await client.getUploadURL(authorization: authorization, bucketID: "bucket")
@@ -826,7 +1095,7 @@ final class RetraceCLITests: XCTestCase {
         XCTAssertEqual(result.fileId, "file-id")
         let requests = await transport.requests
         XCTAssertEqual(requests.count, 3)
-        XCTAssertEqual(requests[0].request.url?.absoluteString, "https://api.backblazeb2.com/b2api/v4/b2_authorize_account")
+        XCTAssertEqual(requests[0].request.url, Self.stubAuthorizationURL)
         XCTAssertEqual(requests[0].request.httpMethod, "GET")
         XCTAssertEqual(requests[0].request.value(forHTTPHeaderField: "Authorization"), "Basic " + Data("fixture-id:fixture-key".utf8).base64EncodedString())
         XCTAssertEqual(requests[1].request.url?.path, "/b2api/v4/b2_get_upload_url")
@@ -858,7 +1127,7 @@ final class RetraceCLITests: XCTestCase {
                                                   (400, "bad_request", .badRequest), (503, "service_unavailable", .retryable)]
         for (status, code, expected) in cases {
             let stub = B2StubTransport(responses: [(status, "{\"status\":\(status),\"code\":\"\(code)\",\"message\":\"must-not-echo-provider-message\"}")])
-            let client = B2Client(enabled: true, transport: stub, credentials: { B2Credentials(keyID: "id", applicationKey: "key") })
+            let client = B2Client(enabled: true, transport: stub, credentials: { B2Credentials(keyID: "id", applicationKey: "key") }, authorizationURL: Self.stubAuthorizationURL)
             do { _ = try await client.authorize(); XCTFail("Expected typed API error") }
             catch {
                 XCTAssertEqual(error as? B2ClientError, expected)
@@ -874,7 +1143,7 @@ final class RetraceCLITests: XCTestCase {
             (200, #"{"files":[],"nextFileName":null,"nextFileId":null}"#),
             (200, #"{"fileId":"file-id","fileName":"chunks/one"}"#)
         ])
-        let client = B2Client(enabled: true, transport: transport, credentials: { B2Credentials(keyID: "id", applicationKey: "key") })
+        let client = B2Client(enabled: true, transport: transport, credentials: { B2Credentials(keyID: "id", applicationKey: "key") }, authorizationURL: Self.stubAuthorizationURL)
         let authorization = try await client.authorize()
         let versions = try await client.listFileVersions(authorization: authorization, bucketID: "bucket")
         XCTAssertEqual(versions.map(\.fileId), ["file-id"])
@@ -893,6 +1162,7 @@ final class RetraceCLITests: XCTestCase {
 
     private static let authorizationJSON = #"{"accountId":"account","authorizationToken":"account-token","apiInfo":{"storageApi":{"apiUrl":"https://api.example.test","downloadUrl":"https://download.example.test","recommendedPartSize":100000000,"absoluteMinimumPartSize":5000000,"capabilities":["listFiles","writeFiles"]}},"applicationKeyExpirationTimestamp":null}"#
     private static let fileJSON = #"{"fileId":"file-id","fileName":"chunks/one","action":"upload","contentLength":3,"contentSha1":"a9993e364706816aba3e25717850c26c9cd0d89d","uploadTimestamp":1234,"fileInfo":{}}"#
+    private static let stubAuthorizationURL = URL(string: "https://api.example.test/b2api/v4/b2_authorize_account")!
 
     func testMissingRootMissingDatabaseAndZeroByteDatabaseDoNotCreateSource() async throws {
         try assertError(await run(), "storage_root_missing")
@@ -1599,15 +1869,80 @@ final class RetraceCLITests: XCTestCase {
 }
 
 private actor B2StubTransport: B2Transport {
+    struct Stored: Sendable {
+        let id: String
+        let bytes: Data
+        var sha1: String { Insecure.SHA1.hash(data: bytes).map { String(format: "%02x", $0) }.joined() }
+        func json(key: String) -> [String: Any] {
+            ["fileId": id, "fileName": key, "action": "upload", "contentLength": bytes.count,
+             "contentSha1": sha1, "uploadTimestamp": 1234, "fileInfo": [:]]
+        }
+    }
     struct Recorded: Sendable {
         let request: URLRequest
         let file: URL?
     }
     var requests: [Recorded] = []
     private var responses: [(Int, String)]
-    init(responses: [(Int, String)]) { self.responses = responses }
+    private var objectStore = false
+    private var loseUploadResponseFor: String?
+    private var deleteFailure = false
+    private let onAuthorize: (@Sendable () throws -> Void)?
+    var objects: [String: [Stored]] = [:]
+    init(responses: [(Int, String)]) { self.responses = responses; onAuthorize = nil }
+    init(objectStore: Bool, loseUploadResponseFor: String? = nil, onAuthorize: (@Sendable () throws -> Void)? = nil) {
+        responses = []; self.objectStore = objectStore; self.loseUploadResponseFor = loseUploadResponseFor
+        self.onAuthorize = onAuthorize
+    }
+    func failNextDelete() { deleteFailure = true }
+    func seed(key: String, bytes: Data) { objects[key, default: []].insert(Stored(id: UUID().uuidString, bytes: bytes), at: 0) }
     func send(_ request: URLRequest, file: URL?) async throws -> (Data, HTTPURLResponse) {
+        // Fail every test immediately if any client forgets to inject its base URL.
+        guard request.url?.host?.hasSuffix(".example.test") == true else {
+            XCTFail("Test transport received a non-fixture URL")
+            throw B2ClientError.invalidRequest
+        }
         requests.append(Recorded(request: request, file: file))
+        if objectStore {
+            let body = try request.httpBody.map { try JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+            let json: [String: Any]
+            switch request.url?.lastPathComponent {
+            case "b2_authorize_account":
+                try onAuthorize?()
+                json = ["accountId": "fixture-account", "authorizationToken": "fixture-token", "apiInfo": ["storageApi": [
+                    "apiUrl": "https://api.example.test", "downloadUrl": "https://download.example.test",
+                    "recommendedPartSize": 100000000, "absoluteMinimumPartSize": 5000000,
+                    "capabilities": ["listFiles", "writeFiles", "deleteFiles"], "bucketId": "fixture-bucket"]]]
+            case "b2_get_upload_url":
+                json = ["bucketId": "fixture-bucket", "uploadUrl": "https://upload.example.test/b2_upload_file", "authorizationToken": "fixture-upload"]
+            case "b2_list_file_versions":
+                let prefix = body?["prefix"] as? String ?? ""
+                json = ["files": objects.keys.sorted().filter { $0.hasPrefix(prefix) }.flatMap { key in
+                    objects[key, default: []].map { $0.json(key: key) }
+                }]
+            case "b2_upload_file":
+                let key = try XCTUnwrap(request.value(forHTTPHeaderField: "X-Bz-File-Name")?.removingPercentEncoding)
+                let bytes = try Data(contentsOf: XCTUnwrap(file))
+                let stored = Stored(id: UUID().uuidString, bytes: bytes)
+                XCTAssertEqual(request.value(forHTTPHeaderField: "X-Bz-Content-Sha1"), stored.sha1)
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Length"), String(bytes.count))
+                objects[key, default: []].insert(stored, at: 0)
+                if loseUploadResponseFor == key {
+                    loseUploadResponseFor = nil
+                    throw B2ClientError.transportFailed // Provider committed; client never saw the response.
+                }
+                json = stored.json(key: key)
+            case "b2_delete_file_version":
+                if deleteFailure { deleteFailure = false; throw B2ClientError.transportFailed }
+                let key = try XCTUnwrap(body?["fileName"] as? String)
+                let id = try XCTUnwrap(body?["fileId"] as? String)
+                objects[key, default: []].removeAll { $0.id == id }
+                json = ["fileName": key, "fileId": id]
+            default: XCTFail("Unexpected stub endpoint"); throw B2ClientError.invalidRequest
+            }
+            return (try JSONSerialization.data(withJSONObject: json),
+                try XCTUnwrap(HTTPURLResponse(url: XCTUnwrap(request.url), statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)))
+        }
         guard !responses.isEmpty else { throw URLError(.badServerResponse) }
         let (status, body) = responses.removeFirst()
         let response = try XCTUnwrap(HTTPURLResponse(url: XCTUnwrap(request.url), statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil))
