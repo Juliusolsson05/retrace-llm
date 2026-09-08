@@ -1,8 +1,8 @@
 # Project Time Attribution — Staged Decomposition
 
-- **Status:** DRAFT — Phase 2. **Built only after `optimization-and-cloud-sync.md` (Phase 1: performance optimization + cloud sync + CLI) ships.** No implementation until this decomposition is also explicitly approved.
-- **Date:** 2026-09-07 (revised same day: build order changed to cloud → CLI → LLM; harness approach switched to an existing framework with project memory and auto-mapping)
-- **Branch:** `feat/project-time-attribution`
+- **Status:** REVISED 2026-09-08 — implementation approved for Stage 1. Phase 1's cloud-sync/CLI track shipped on `feat/phase1-foundation` (b1ec7e3…583763a: B2 sync, snapshots, deletion ledger, encryption, gated uploads, baseline harness, frame-evidence CLI). Phase 1's Track A (performance optimization) is explicitly deferred, not blocked: attribution reads are observational and Track A lands separately without contract changes.
+- **Date:** 2026-09-07 (revised 2026-09-07: build order cloud → CLI → LLM; **revised 2026-09-08: harness language reversed from Python to Swift**, see Locked decisions)
+- **Branch:** `feat/project-time-attribution` (branched from `feat/phase1-foundation`)
 - **Methodology:** staged-decomposition (each stage produces a named, independently verifiable artifact; real fixtures, never imagination)
 
 ---
@@ -15,12 +15,14 @@ Daily project-time report for every Retrace user: per-project durations with act
 
 | Decision | Value |
 |---|---|
+| **Harness language** | **Swift, in-repo** (reversed 2026-09-08 from Python/LangGraph). Rationale: (1) the product ships inside the .app to non-technical users — a Python runtime would force building the harness twice (dev in Python, ship in Swift); (2) the agent graph is small (classify → auto-map → escalate → propose) and the Gemini surface needed (structured output, function calling, Batch JSONL, countTokens) is plain HTTPS + Codable; (3) live "what am I doing now" classification reads the live WAL DB, natural from a Swift process holding the injected read pool. Cost: checkpointing/retries/spend guards that LangGraph would provide are hand-rolled in Stage 3 under the same verification bar (replay fixtures, idempotency ledger, countTokens ±20%). |
+| **Process boundary** | Harness runs **out-of-process** from the recorder (XPC helper pattern or the CLI binary as host). Measured 2026-09-08: the recording app peaks ~956MB against the 1GB target — the harness must never add image-decode/JSON pressure to the recorder process. |
+| **SDK boundary** | `RetraceKit` library target extracted from the Phase 1 CLI internals (pure moves, CLI JSON contracts byte-identical). The harness depends ONLY on RetraceKit + its own state; never on `App/`, `UI/`, `Capture/` internals. Dual-mode session: strict read-only VFS (file mode) or the app's injected read pool (in-app mode). |
 | Every-frame model | **Gemini 3.5 Flash-Lite** (GA) — structured output + function calling, 1M context |
 | Escalation model | **Gemini 3.8 Flash** — new/ambiguous clusters only |
 | Frame prep | ≤768px downscale, `media_resolution=low` (~280 tokens/frame, not 1120 default) |
 | Batching | Overnight Batch API (JSONL, idempotency keys, 50% off); Batch is not idempotent on retry — keys tracked locally |
 | Caching | Implicit context caching (default-on) for the project-roster system prompt |
-| Harness | Existing framework — LangGraph (persistence + checkpointing) or Pydantic AI (agents + spend controls); decided at phase-2 start |
 | Project memory | Harness-native persistent store: known projects, learned identifiers (repos, domains, title patterns), recent decisions |
 | Auto-mapping | Harness maps observed activity → existing project from memory, or creates a new project when nothing matches |
 | Deterministic math | Timestamps → durations → totals computed in plain code; the model never does arithmetic |
@@ -38,12 +40,14 @@ Daily project-time report for every Retrace user: per-project durations with act
 
 | Artifact | Trusted for | Known limitations |
 |---|---|---|
-| Phase 1 output: optimized pipeline + cloud sync on B2 + `retrace` CLI | Durable evidence source, existing CLI to extend | Sync policy constraints (tombstones, revisions) |
+| Phase 1 CLI (`retrace-cli`) on `feat/phase1-foundation` | `status`, day `export` (metadata JSONL), `frame --frame-id` (OCR text + geometry + lineage, FTS5-sliced like NodeQueries), `frame --png` (HEVC decode, 3840×2160 verified live), `baseline --session/--harvest-log`, gated encrypted sync, snapshot/verify/restore | Export is metadata-only by privacy design; no text search command yet |
+| Strict read-only source VFS (`SourceDatabase`) | WAL-safe concurrent reads while the app records (verified against a live session) | readonly_shm guarantees are weaker for same-process later connections — in-app mode uses the app's read pool instead |
 | `Database/ReadConnectionSupport.swift` | Read-only DB open incl. key retrieval | Snapshot vs in-flight writes — export fences |
 | `segment`/`frame`/`node` tables | Real recorded evidence | URL backfill makes some URLs non-contemporaneous |
-| `Storage/ImageExtractor.swift` | Frame decode from finalized video | Unfinalized frames only via WAL |
-| OCR text in `node` | On-device text extraction | Two ingestion paths |
-| **Forbidden bootstrap** | — | `AppCoordinator`/`ServiceContainer` run migrations, retention, workers — CLI must never initialize them |
+| `Storage/ImageExtractor.swift` (`HEVCStorageExtractor`) | Frame decode from finalized video | Unfinalized frames only via WAL |
+| OCR text in `node` + `searchRanking` FTS5 | On-device text extraction; text = SUBSTR(c0‖c1 via doc_segment) | Two ingestion paths; FTS ingestion can lag processing (textAvailable reports it) |
+| Live telemetry (`baseline` harness) | CPU/memory/OCR/dedup sampling against the running app (p50/p95) | Observational only |
+| **Forbidden bootstrap** | — | `AppCoordinator`/`ServiceContainer` run migrations, retention, workers — the SDK and harness must never initialize them |
 
 **Timing invariant:** frames are packed at nominal 30 FPS while capture occurs seconds apart. All time accounting uses **real capture timestamps**, never playback time.
 
@@ -62,9 +66,10 @@ Daily project-time report for every Retrace user: per-project durations with act
 
 The coordination risk is **state ownership**: what the harness believes (memory, decisions) vs what code computes (durations). Rule: the harness owns *decisions and memory*; plain code owns *arithmetic and the ledger format*.
 
-- **Location:** `Attribution/` top-level module (own `AGENTS.md`, created in the first implementation commit of this phase) + `Sources/RetraceCLI/` (extended from Phase 1).
+- **Location:** `Attribution/` top-level module (own `AGENTS.md`, created in the first implementation commit of this phase) + `Sources/RetraceKit/` (SDK boundary) + `Sources/RetraceCLI/` (JSON face; extended from Phase 1).
+- **Dependency direction:** `RetraceCLI → RetraceKit`, `Attribution → RetraceKit` only. RetraceKit depends on `Shared`/`Database`/`Storage`; it never grows model calls, prompts, or attribution logic.
 - **Single consumer of the accounting layer:** the report command.
-- **Forbidden:** `UI/`, `Capture/`, `Storage/`, `App/`, `Database/` importing attribution internals; attribution importing app bootstrap; the harness writing the ledger directly (it only proposes; code disposes).
+- **Forbidden:** `UI/`, `Capture/`, `Storage/`, `App/`, `Database/` importing attribution internals; attribution importing app bootstrap; the harness writing the ledger directly (it only proposes; code disposes); the harness writing anything inside the recording storage root (its state lives under its own root, like RetraceCLI's).
 
 ---
 
@@ -77,11 +82,11 @@ The coordination risk is **state ownership**: what the harness believes (memory,
 - **Why separate:** every later stage builds on this corpus; real shapes and volumes replace assumptions.
 - **Reality check:** the author's actual recorded working days.
 
-### Stage 1 — Read-only evidence exporter CLI
+### Stage 1 — RetraceKit SDK + read-only evidence exporter CLI
 
-- **Produces:** `retrace export --day ... --out DIR`: read-only DB access, frame decode + ≤768px downscale, OCR assembly, manifest with provenance. Creates `Attribution/` + AGENTS.md entries.
-- **Verified by:** end-to-end on the real DB; schema conformance; grep gate asserting zero `App/` imports; concurrent-with-recording safety.
-- **Why separate:** the harness develops against a stable export contract.
+- **Produces:** `Sources/RetraceKit/` library target extracted from CLI internals by pure moves (Session/readers/models; CLI JSON contracts byte-identical — the existing 131-test suite is the refactor gate), plus `retrace-cli export --day ... --out DIR`: read-only DB access, frame decode + ≤768px downscale, OCR assembly, manifest with provenance. Creates `Attribution/` + AGENTS.md entries only when Stage 3 begins (nothing attribution-specific lands before then).
+- **Verified by:** full suite green with zero contract changes (byte-diff stdout against pre-refactor outputs on the live corpus); end-to-end on the real DB; schema conformance; grep gate asserting zero `App/` imports; concurrent-with-recording safety.
+- **Why separate:** the harness develops against a stable SDK/export contract.
 - **Reality check:** Stage 0 corpus.
 
 ### Stage 2 — Observed-case catalog (automated)
@@ -91,11 +96,11 @@ The coordination risk is **state ownership**: what the harness believes (memory,
 - **Why separate:** prompts and memory schema must be designed against measured shapes.
 - **Reality check:** Stage 0/1 exports.
 
-### Stage 3 — Harness foundation on existing framework
+### Stage 3 — Swift harness foundation
 
-- **Produces:** framework decision (LangGraph vs Pydantic AI, documented rationale) + running skeleton: agent graph with tools (query evidence, read/write project memory, request escalation), checkpointed persistence, `countTokens` pre-flight pinning real cost, Batch submission with local idempotency-key ledger, spend ceiling, cost ledger, recorded-response replay fixtures.
+- **Produces:** `Attribution/` module skeleton with an `LLMProvider` protocol (Flash-Lite structured classify, Flash escalation, Batch JSONL submission with a local idempotency-key ledger, countTokens pre-flight), checkpointed run state (resume after crash), spend-ceiling guard, cost ledger, recorded-response replay fixtures, and the out-of-process host boundary (XPC helper pattern or CLI binary as host — never the recorder process).
 - **Verified by:** offline replay suite green (no network); countTokens within ±20% of the cost model; one opt-in live smoke over one corpus hour; crash/resume of a batch preserves exactly-once keys.
-- **Why separate:** transport, persistence, and spend correctness are testable with zero attribution intelligence; isolates financial risk.
+- **Why separate:** transport, persistence, and spend correctness are testable with zero attribution intelligence; isolates financial risk. This stage replaces the retired framework decision — LangGraph's persistence/checkpointing duties are hand-rolled here under the same bar.
 - **Reality check:** corpus frames, real token counts.
 
 ### Stage 4 — Project memory + auto-mapping
@@ -125,8 +130,8 @@ The coordination risk is **state ownership**: what the harness believes (memory,
 
 1. Real retained-frames/day volume — measured Stage 0; cost is sensitive to it.
 2. Exact tokens/frame at `low` for 3.5 Flash-Lite — pinned Stage 3.
-3. Framework pick (LangGraph vs Pydantic AI) — Stage 3, with rationale.
-4. Language boundary — Swift exporter + Python harness is the leading shape (both candidate frameworks are Python); confirmed at Stage 3.
+3. ~~Framework pick (LangGraph vs Pydantic AI)~~ — resolved 2026-09-08: Swift, hand-rolled (see Locked decisions).
+4. ~~Language boundary — Swift exporter + Python harness~~ — resolved 2026-09-08: Swift end-to-end.
 5. Accuracy is not claimed until real-use review; v1 guarantees invariants + visible unknowns (honest limitation — no upfront labels exist by design).
 6. Idle/lock evidence completeness in the DB — if gapped, capture-side evidence becomes a small separate workstream; CLI proceeds meanwhile.
 7. Privacy copy for shipped users (frames leave device by design) — before public release.
