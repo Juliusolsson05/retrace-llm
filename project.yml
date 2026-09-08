@@ -156,6 +156,8 @@ targets:
           - PROGRESS.md
     dependencies:
       - target: Shared
+      - package: swift-sqlcipher
+        product: SQLCipher
     settings:
       base:
         CODE_SIGNING_REQUIRED: NO
