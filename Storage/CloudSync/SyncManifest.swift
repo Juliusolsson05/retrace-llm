@@ -3,7 +3,7 @@ import SQLCipher
 import Darwin
 
 public enum SyncManifestError: Error, Sendable, Equatable {
-    case unsafeStateRoot, unavailable, invalidRecord, missingObject, staleRevision, readOnly, closed
+    case unsafeStateRoot, unavailable, invalidRecord, missingObject, staleRevision, pendingDeletion, readOnly, closed
 }
 
 /// CLI-owned state, deliberately independent of the application's schema and migrations.
@@ -82,6 +82,9 @@ public actor SyncManifest {
         }
         do {
             sqlite3_busy_timeout(handle, 1000)
+            // Validate before migration: never replace a damaged/lost ledger with an
+            // empty one. Version 0 is the only legacy format without a deletions table.
+            _ = try Self.validateDeletionLedger(handle)
             if readOnly {
                 try Self.execute(handle, "PRAGMA query_only=ON;")
             } else {
@@ -112,6 +115,14 @@ public actor SyncManifest {
                     );
                     CREATE INDEX IF NOT EXISTS snapshots_by_path ON snapshots(snapshotPath,createdMs DESC,id DESC);
                     CREATE INDEX IF NOT EXISTS snapshots_by_hash ON snapshots(sha256,createdMs DESC,id DESC);
+                    CREATE TABLE IF NOT EXISTS deletions (
+                        objectKey TEXT NOT NULL,
+                        deletedAtMs INTEGER NOT NULL,
+                        reason TEXT NOT NULL,
+                        appliedLocal INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(objectKey, deletedAtMs)
+                    );
+                    PRAGMA user_version=1;
                     COMMIT;
                     """)
             }
@@ -144,7 +155,105 @@ public actor SyncManifest {
     }
 
     public func listPending() throws -> [Object] {
-        try rows(sql: "SELECT key,sha256,sizeBytes,mtimeNs,revision,uploadState,uploadedAt,contentTag FROM objects WHERE uploadState='pending' ORDER BY key")
+        guard !isClosed else { throw SyncManifestError.closed }
+        guard let db else { return [] }
+        let hasLedger = try Self.validateDeletionLedger(db)
+        // Select queue eligibility in one SQLite snapshot, including purges from
+        // other processes. Keep object history without exposing it as queued work.
+        let suppression = hasLedger ? " AND NOT EXISTS (SELECT 1 FROM deletions d WHERE d.objectKey=objects.key)" : ""
+        return try rows(sql: "SELECT key,sha256,sizeBytes,mtimeNs,revision,uploadState,uploadedAt,contentTag FROM objects WHERE uploadState='pending'"
+                        + suppression + " ORDER BY key")
+    }
+
+    /// Intent is durable before app retention runs. Retrying the same key/reason
+    /// reopens its local acknowledgement without manufacturing another cloud purge.
+    /// History in objects is retained so prior revisions/provider versions can be deleted.
+    @discardableResult
+    public func recordPendingDeletions(keys: [String], reason: String) throws -> Int {
+        try transaction { db in
+            guard !reason.isEmpty, !reason.contains("\0"),
+                  keys.allSatisfy({ !$0.isEmpty && !$0.contains("\0") }) else { throw SyncManifestError.invalidRecord }
+            guard try Self.validateDeletionLedger(db) else { throw SyncManifestError.unavailable }
+            var inserted = 0
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
+            for key in Set(keys).sorted() {
+                var update: OpaquePointer?
+                defer { sqlite3_finalize(update) }
+                try Self.prepare(db, "UPDATE deletions SET appliedLocal=0 WHERE objectKey=? AND reason=?", &update)
+                try Self.bind(key, to: update, at: 1)
+                try Self.bind(reason, to: update, at: 2)
+                guard sqlite3_step(update) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+                if sqlite3_changes(db) > 0 { continue }
+                var latest: OpaquePointer?
+                defer { sqlite3_finalize(latest) }
+                try Self.prepare(db, "SELECT MAX(deletedAtMs) FROM deletions WHERE objectKey=?", &latest)
+                try Self.bind(key, to: latest, at: 1)
+                guard sqlite3_step(latest) == SQLITE_ROW else { throw SyncManifestError.unavailable }
+                let previous = sqlite3_column_type(latest, 0) == SQLITE_NULL ? -1 : sqlite3_column_int64(latest, 0)
+                guard previous < Int64.max else { throw SyncManifestError.invalidRecord }
+                let timestamp = max(now, previous + 1)
+                guard sqlite3_step(latest) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+                var insert: OpaquePointer?
+                defer { sqlite3_finalize(insert) }
+                try Self.prepare(db, "INSERT INTO deletions(objectKey,deletedAtMs,reason,appliedLocal) VALUES(?,?,?,0)", &insert)
+                try Self.bind(key, to: insert, at: 1)
+                sqlite3_bind_int64(insert, 2, timestamp)
+                try Self.bind(reason, to: insert, at: 3)
+                guard sqlite3_step(insert) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+                inserted += 1
+            }
+            return inserted
+        }
+    }
+
+    /// appliedLocal describes only app retention. Until cloud all-version deletion
+    /// is implemented, EVERY ledger key remains suppressed, including local applies.
+    public func pendingDeletionKeys() throws -> Set<String> {
+        try deletionKeys(reason: nil)
+    }
+
+    public func isPendingDeletion(key: String) throws -> Bool {
+        try pendingDeletionKeys().contains(key)
+    }
+
+    /// The reason carries the requested evidence day, which can differ from the
+    /// chunk directory day and must survive removal of source frame/video rows.
+    public func deletionKeys(reason: String?) throws -> Set<String> {
+        guard !isClosed else { throw SyncManifestError.closed }
+        guard let db else { return [] }
+        guard try Self.validateDeletionLedger(db) else { return [] }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        try Self.prepare(db, "SELECT DISTINCT objectKey FROM deletions" + (reason == nil ? "" : " WHERE reason=?"), &statement)
+        if let reason { try Self.bind(reason, to: statement, at: 1) }
+        var keys: Set<String> = []
+        while true {
+            let status = sqlite3_step(statement)
+            if status == SQLITE_DONE { return keys }
+            guard status == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else { throw SyncManifestError.unavailable }
+            keys.insert(String(cString: text))
+        }
+    }
+
+    @discardableResult
+    public func markAppliedLocal(keys: [String], reason: String? = nil) throws -> Int {
+        try transaction { db in
+            guard try Self.validateDeletionLedger(db) else { throw SyncManifestError.unavailable }
+            guard keys.allSatisfy({ !$0.isEmpty && !$0.contains("\0") }),
+                  reason?.contains("\0") != true else { throw SyncManifestError.invalidRecord }
+            var changed = 0
+            for key in Set(keys).sorted() {
+                var statement: OpaquePointer?
+                defer { sqlite3_finalize(statement) }
+                try Self.prepare(db, "UPDATE deletions SET appliedLocal=1 WHERE objectKey=? AND appliedLocal=0"
+                                 + (reason == nil ? "" : " AND reason=?"), &statement)
+                try Self.bind(key, to: statement, at: 1)
+                if let reason { try Self.bind(reason, to: statement, at: 2) }
+                guard sqlite3_step(statement) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+                changed += Int(sqlite3_changes(db))
+            }
+            return changed
+        }
     }
 
     @discardableResult
@@ -217,6 +326,7 @@ public actor SyncManifest {
                   sha256.utf8.count == 64, sha256.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
                 throw SyncManifestError.invalidRecord
             }
+            guard try !isPendingDeletion(key: key) else { throw SyncManifestError.pendingDeletion }
             let old = try lookup(key: key)
             let same = old?.sha256 == sha256
             if same, old?.sizeBytes != sizeBytes { throw SyncManifestError.invalidRecord }
@@ -246,6 +356,7 @@ public actor SyncManifest {
     @discardableResult
     public func incrementRevision(key: String) throws -> Object {
         try transaction { db in
+            guard try !isPendingDeletion(key: key) else { throw SyncManifestError.pendingDeletion }
             guard let old = try lookup(key: key) else { throw SyncManifestError.missingObject }
             let revision = try Self.nextRevision(old.revision)
             var statement: OpaquePointer?
@@ -260,6 +371,7 @@ public actor SyncManifest {
 
     public func markUploaded(key: String, revision: Int64, uploadedAt: Int64, contentTag: String?) throws {
         try transaction { db in
+            guard try !isPendingDeletion(key: key) else { throw SyncManifestError.pendingDeletion }
             guard uploadedAt >= 0, contentTag?.contains("\0") != true else { throw SyncManifestError.invalidRecord }
             guard let old = try lookup(key: key) else { throw SyncManifestError.missingObject }
             // An in-flight transfer may complete after a rewrite. Never mark newer bytes uploaded.
@@ -316,6 +428,48 @@ public actor SyncManifest {
     private static func nextRevision(_ value: Int64) throws -> Int64 {
         guard value > 0, value < Int64.max else { throw SyncManifestError.invalidRecord }
         return value + 1
+    }
+
+    private static func validateDeletionLedger(_ db: OpaquePointer) throws -> Bool {
+        var version: OpaquePointer?
+        defer { sqlite3_finalize(version) }
+        try prepare(db, "PRAGMA user_version", &version)
+        guard sqlite3_step(version) == SQLITE_ROW else { throw SyncManifestError.unavailable }
+        let schemaVersion = sqlite3_column_int(version, 0)
+        guard (0...1).contains(schemaVersion), sqlite3_step(version) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+        var table: OpaquePointer?
+        defer { sqlite3_finalize(table) }
+        try prepare(db, "SELECT type FROM sqlite_master WHERE name='deletions'", &table)
+        let status = sqlite3_step(table)
+        if status == SQLITE_DONE {
+            guard schemaVersion == 0 else { throw SyncManifestError.unavailable }
+            return false
+        }
+        guard status == SQLITE_ROW, let type = sqlite3_column_text(table, 0), String(cString: type) == "table",
+              sqlite3_step(table) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+        var columns: OpaquePointer?
+        defer { sqlite3_finalize(columns) }
+        try prepare(db, "PRAGMA table_info(deletions)", &columns)
+        for (name, type, primaryKey) in [("objectKey", "TEXT", 1), ("deletedAtMs", "INTEGER", 2),
+                                          ("reason", "TEXT", 0), ("appliedLocal", "INTEGER", 0)] {
+            guard sqlite3_step(columns) == SQLITE_ROW,
+                  let actualName = sqlite3_column_text(columns, 1), String(cString: actualName) == name,
+                  let actualType = sqlite3_column_text(columns, 2), String(cString: actualType).uppercased() == type,
+                  sqlite3_column_int(columns, 3) == 1, sqlite3_column_int(columns, 5) == primaryKey else {
+                throw SyncManifestError.unavailable
+            }
+        }
+        guard sqlite3_step(columns) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+        var invalid: OpaquePointer?
+        defer { sqlite3_finalize(invalid) }
+        try prepare(db, """
+            SELECT 1 FROM deletions WHERE typeof(objectKey)!='text' OR length(objectKey)=0 OR instr(objectKey,char(0))>0
+            OR typeof(deletedAtMs)!='integer' OR deletedAtMs<0
+            OR typeof(reason)!='text' OR length(reason)=0 OR instr(reason,char(0))>0
+            OR typeof(appliedLocal)!='integer' OR appliedLocal NOT IN (0,1) LIMIT 1
+            """, &invalid)
+        guard sqlite3_step(invalid) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+        return true
     }
 
     private static func prepare(_ db: OpaquePointer, _ sql: String, _ statement: inout OpaquePointer?) throws {

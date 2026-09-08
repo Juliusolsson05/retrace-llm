@@ -60,7 +60,7 @@ struct CLIExportFrame: Encodable, Sendable {
 }
 
 enum SourceDatabase {
-    static func withConnection<T>(root: URL, _ body: (DatabaseConnection) throws -> T) throws -> T {
+    static func withConnection<T>(root: URL, allowMissingVideoPath: Bool = false, _ body: (DatabaseConnection) throws -> T) throws -> T {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory) else {
             throw CLIError("storage_root_missing", "Storage root does not exist. Pass --storage-root PATH to an existing Retrace storage directory.")
@@ -99,11 +99,11 @@ enum SourceDatabase {
         // The factory wrappers do not own/close handles. Every statement below is finalized
         // before this scope ends, including errors. close_v2 also safely handles thrown callers.
         defer { sqlite3_close_v2(handle) }
-        try validateSchema(connection)
+        try validateSchema(connection, allowMissingVideoPath: allowMissingVideoPath)
         return try body(connection)
     }
 
-    private static func validateSchema(_ connection: DatabaseConnection) throws {
+    private static func validateSchema(_ connection: DatabaseConnection, allowMissingVideoPath: Bool) throws {
         // Validate the minimum native contract, not every later app migration. No text/path
         // values are fetched. Types distinguish native integer timestamps from Rewind TEXT.
         let required: [String: [String: String]] = [
@@ -128,7 +128,10 @@ enum SourceDatabase {
                     }
                     guard result == SQLITE_DONE else { throw schemaError() }
                 }
-                guard columns.allSatisfy({ observed[$0.key] == $0.value }) else { throw schemaError() }
+                guard columns.allSatisfy({
+                    (allowMissingVideoPath && table == "video" && $0.key == "path" && observed["path"] == nil)
+                        || observed[$0.key] == $0.value
+                }) else { throw schemaError() }
             }
             try statement(connection, "SELECT MAX(version) FROM schema_migrations") { stmt in
                 guard sqlite3_step(stmt) == SQLITE_ROW, sqlite3_column_int64(stmt, 0) >= 1 else { throw schemaError() }
@@ -169,51 +172,9 @@ enum SourceDatabase {
         limit: Int,
         emit: (CLIExportFrame) throws -> Void
     ) throws -> Bool {
-        let calendar = Calendar.current
-        let start = calendar.startOfDay(for: day)
-        guard let end = calendar.date(byAdding: .day, value: 1, to: start) else {
-            throw CLIError("database_query_failed", "Could not determine the next local midnight.")
-        }
-        // The hidden-tag lookup and frame SELECT must observe the same snapshot. This
-        // deferred read transaction does not create journals or reserve a writer lock.
-        try connection.beginTransaction()
-        defer { try? connection.rollback() }
-        let hiddenTagID = try EvidenceReadQueries.hiddenTagID(connection: connection)
-        let boundary = EvidenceReadQueries.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
-        var clauses = ["f.createdAt >= ?", "f.createdAt < ?"]
-        if let visibility = EvidenceReadQueries.nativeVisibleFrameClause(isRewindDatabase: false) {
-            clauses.append(visibility)
-        }
-        if let boundaryClause = boundary.clause { clauses.append(boundaryClause) }
-        if hiddenTagID != nil {
-            clauses.append("""
-                NOT EXISTS (
-                    SELECT 1 FROM segment_tag st_hidden
-                    WHERE st_hidden.segmentId = f.segmentId AND st_hidden.tagId = ?
-                )
-                """)
-        }
-        return try statement(connection, """
-            SELECT f.id, f.createdAt, f.videoId, f.videoFrameIndex, f.segmentId,
-                   NULLIF(s.bundleID, ''), s.windowName, s.browserUrl
-            FROM frame f
-            INNER JOIN segment s ON f.segmentId = s.id
-            WHERE \(clauses.joined(separator: " AND "))
-            ORDER BY f.createdAt ASC, f.id ASC
-            LIMIT ?
-            """) { stmt in
-            config.bindDate(start, to: stmt, at: 1)
-            config.bindDate(end, to: stmt, at: 2)
-            var index: Int32 = 3
-            for date in boundary.bindValues {
-                config.bindDate(date, to: stmt, at: index)
-                index += 1
-            }
-            if let hiddenTagID {
-                sqlite3_bind_int64(stmt, index, hiddenTagID)
-                index += 1
-            }
-            sqlite3_bind_int64(stmt, index, Int64(limit) + 1)
+        try withVisibleDayRows(connection, config: config, day: day, limit: limit,
+            projection: "f.id, f.createdAt, f.videoId, f.videoFrameIndex, f.segmentId, NULLIF(s.bundleID, ''), s.windowName, s.browserUrl"
+        ) { stmt in
             var count = 0
             var result = sqlite3_step(stmt)
             while result == SQLITE_ROW {
@@ -243,6 +204,140 @@ enum SourceDatabase {
         }
     }
 
+    struct PurgeEvidence: Sendable {
+        let frameCount: Int
+        let keys: [String]
+    }
+
+    /// Read only bounded metadata, never OCR or files. A lookahead beyond the bound
+    /// fails the entire command before any deletion intent is committed.
+    static func purgeEvidence(_ connection: DatabaseConnection, config: DatabaseConfig, day: Date,
+                              limit: Int = 50_000) throws -> PurgeEvidence {
+        var columns: Set<String> = []
+        try statement(connection, "SELECT name FROM pragma_table_info('video')") { stmt in
+            var status = sqlite3_step(stmt)
+            while status == SQLITE_ROW {
+                guard let text = sqlite3_column_text(stmt, 0) else { throw purgePathError() }
+                columns.insert(String(cString: text))
+                status = sqlite3_step(stmt)
+            }
+            guard status == SQLITE_DONE else { throw purgePathError() }
+        }
+        let path = columns.contains("path") ? "v.path" : "NULL"
+        let relativePath = columns.contains("relativePath") ? "v.relativePath" : "NULL"
+        return try withVisibleDayRows(connection, config: config, day: day, limit: limit,
+            projection: "f.createdAt, f.videoId, \(path), \(relativePath)",
+            joins: "LEFT JOIN video v ON f.videoId=v.id"
+        ) { stmt in
+            var count = 0
+            var keys: Set<String> = []
+            var status = sqlite3_step(stmt)
+            while status == SQLITE_ROW {
+                guard count < limit else {
+                    throw CLIError("purge_day_limit", "Purge day exceeds 50000 visible frames; no deletion rows were recorded.", exitCode: 4)
+                }
+                guard sqlite3_column_type(stmt, 0) == SQLITE_INTEGER,
+                      [SQLITE_INTEGER, SQLITE_NULL].contains(sqlite3_column_type(stmt, 1)) else { throw purgePathError() }
+                count += 1
+                if sqlite3_column_type(stmt, 1) != SQLITE_NULL {
+                    let videoID = sqlite3_column_int64(stmt, 1)
+                    guard videoID > 0 else { throw purgePathError() }
+                    var stored: String?
+                    for column: Int32 in [2, 3] {
+                        if sqlite3_column_type(stmt, column) == SQLITE_NULL { continue }
+                        guard sqlite3_column_type(stmt, column) == SQLITE_TEXT,
+                              let text = sqlite3_column_text(stmt, column) else { throw purgePathError() }
+                        let value = String(decoding: UnsafeBufferPointer(start: text, count: Int(sqlite3_column_bytes(stmt, column))), as: UTF8.self)
+                        if !value.isEmpty {
+                            // Conflicting paths are ambiguous; do not silently omit one.
+                            if let stored, stored != value { throw purgePathError() }
+                            stored = value
+                        }
+                    }
+                    let key = try stored ?? timestampChunkKey(videoID)
+                    guard ChunkInventory.isCanonicalKey(key) else { throw purgePathError() }
+                    keys.insert(key)
+                }
+                status = sqlite3_step(stmt)
+            }
+            guard status == SQLITE_DONE else { throw purgePathError() }
+            return PurgeEvidence(frameCount: count, keys: keys.sorted())
+        }
+    }
+
+    private static func timestampChunkKey(_ videoID: Int64) throws -> String {
+        // Native video.path stores writer.relativePath, whose filename can differ
+        // from the AUTOINCREMENT video.id (SegmentQueries.insert). Always prefer
+        // that path: its creation day survives midnight and timezone changes.
+        // Pathless legacy timestamp IDs are epoch milliseconds, as generated by
+        // StorageManager.createSegmentWriter. Never interpret small DB sequence IDs
+        // as 1970 timestamps. No trustworthy path means fail closed for native rows.
+        guard (946_684_800_000...253_402_214_399_999).contains(videoID) else { throw purgePathError() }
+        let date = Date(timeIntervalSince1970: Double(videoID) / 1000)
+        let calendar = Calendar.current
+        // Exactly DirectoryManager.segmentURL's calendar and formatting, without
+        // calling it (that API creates source directories).
+        return String(format: "chunks/%04d%02d/%02d/%lld", calendar.component(.year, from: date),
+                      calendar.component(.month, from: date), calendar.component(.day, from: date), videoID)
+    }
+
+    private static func purgePathError() -> CLIError {
+        CLIError("purge_evidence_unavailable", "Cannot resolve every visible frame's canonical chunk key; no deletion rows were recorded.")
+    }
+
+    private static func withVisibleDayRows<T>(
+        _ connection: DatabaseConnection, config: DatabaseConfig, day: Date, limit: Int,
+        projection: String, joins: String = "", body: (OpaquePointer) throws -> T
+    ) throws -> T {
+        let calendar = Calendar.current
+        let start = calendar.startOfDay(for: day)
+        guard let end = calendar.date(byAdding: .day, value: 1, to: start) else {
+            throw CLIError("database_query_failed", "Could not determine the next local midnight.")
+        }
+        // The hidden-tag lookup and frame SELECT must observe the same snapshot. This
+        // deferred read transaction does not create journals or reserve a writer lock.
+        try connection.beginTransaction()
+        defer { try? connection.rollback() }
+        let hiddenTagID = try EvidenceReadQueries.hiddenTagID(connection: connection)
+        let boundary = EvidenceReadQueries.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
+        var clauses = ["f.createdAt >= ?", "f.createdAt < ?"]
+        if let visibility = EvidenceReadQueries.nativeVisibleFrameClause(isRewindDatabase: false) {
+            clauses.append(visibility)
+        }
+        if let boundaryClause = boundary.clause { clauses.append(boundaryClause) }
+        if hiddenTagID != nil {
+            clauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_hidden
+                    WHERE st_hidden.segmentId = f.segmentId AND st_hidden.tagId = ?
+                )
+                """)
+        }
+        return try statement(connection, """
+            SELECT \(projection)
+            FROM frame f
+            INNER JOIN segment s ON f.segmentId = s.id
+            \(joins)
+            WHERE \(clauses.joined(separator: " AND "))
+            ORDER BY f.createdAt ASC, f.id ASC
+            LIMIT ?
+            """) { stmt in
+            config.bindDate(start, to: stmt, at: 1)
+            config.bindDate(end, to: stmt, at: 2)
+            var index: Int32 = 3
+            for date in boundary.bindValues {
+                config.bindDate(date, to: stmt, at: index)
+                index += 1
+            }
+            if let hiddenTagID {
+                sqlite3_bind_int64(stmt, index, hiddenTagID)
+                index += 1
+            }
+            sqlite3_bind_int64(stmt, index, Int64(limit) + 1)
+            return try body(stmt)
+        }
+    }
+
     private static func statement<T>(_ connection: DatabaseConnection, _ sql: String, _ body: (OpaquePointer) throws -> T) throws -> T {
         let prepared: OpaquePointer?
         do { prepared = try connection.prepare(sql: sql) }
@@ -257,6 +352,15 @@ enum SourceDatabase {
 
 enum ReadOnlySourceVFS {
     static let name = "retrace-cli-readonly"
+    private static let methodsOffset: Int = {
+        let size = Int(sqlite3_vfs_find(nil)!.pointee.szOsFile)
+        let alignment = MemoryLayout<UnsafePointer<sqlite3_io_methods>>.alignment
+        return (size + alignment - 1) / alignment * alignment
+    }()
+
+    private static func originalMethods(_ file: UnsafeMutablePointer<sqlite3_file>) -> UnsafeMutablePointer<UnsafePointer<sqlite3_io_methods>> {
+        UnsafeMutableRawPointer(file).advanced(by: methodsOffset).assumingMemoryBound(to: UnsafePointer<sqlite3_io_methods>.self)
+    }
     // SQLite's built-in Unix VFS opens WAL with CREATE even for a read-only main DB.
     // This process-lifetime, nondefault VFS denies creation/deletion and forces read-only
     // file opens. readonly_shm=1 separately prevents writes through shared-memory mapping.
@@ -268,10 +372,38 @@ enum ReadOnlySourceVFS {
         wrapper.pointee.zName = UnsafePointer(strdup(name))
         wrapper.pointee.pNext = nil
         wrapper.pointee.pAppData = UnsafeMutableRawPointer(base)
+        wrapper.pointee.szOsFile = Int32(methodsOffset + MemoryLayout<UnsafePointer<sqlite3_io_methods>>.size)
         wrapper.pointee.xOpen = { vfs, path, file, flags, outputFlags in
             guard let base = vfs?.pointee.pAppData?.assumingMemoryBound(to: sqlite3_vfs.self) else { return SQLITE_CANTOPEN }
             let readFlags = (flags & ~(SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_DELETEONCLOSE)) | SQLITE_OPEN_READONLY | SQLITE_OPEN_NOFOLLOW
-            return base.pointee.xOpen!(base, path, file, readFlags, outputFlags)
+            let result = base.pointee.xOpen!(base, path, file, readFlags, outputFlags)
+            guard result == SQLITE_OK, let file, let original = file.pointee.pMethods else { return result }
+            originalMethods(file).initialize(to: original)
+            let guarded = UnsafeMutablePointer<sqlite3_io_methods>.allocate(capacity: 1)
+            guarded.initialize(to: original.pointee)
+            // Unix SQLite reuses a process-wide inode SHM mapping. A writer in the
+            // same process can make readonly_shm ineffective on later connections.
+            // Explicit READONLY tells the WAL reader never to update read marks;
+            // bExtend=0 also forbids growing the shared-memory file.
+            guarded.pointee.xShmMap = { file, page, size, _, output in
+                guard let file, let map = originalMethods(file).pointee.pointee.xShmMap else { return SQLITE_IOERR }
+                let result = map(file, page, size, 0, output)
+                return result == SQLITE_OK ? SQLITE_READONLY : result
+            }
+            guarded.pointee.xShmUnmap = { file, _ in
+                guard let file, let unmap = originalMethods(file).pointee.pointee.xShmUnmap else { return SQLITE_IOERR }
+                return unmap(file, 0)
+            }
+            guarded.pointee.xClose = { file in
+                guard let file, let guarded = file.pointee.pMethods else { return SQLITE_IOERR }
+                let original = originalMethods(file).pointee
+                file.pointee.pMethods = original
+                let result = original.pointee.xClose!(file)
+                UnsafeMutablePointer(mutating: guarded).deallocate()
+                return result
+            }
+            file.pointee.pMethods = UnsafePointer(guarded)
+            return SQLITE_OK
         }
         wrapper.pointee.xDelete = { _, _, _ in SQLITE_READONLY }
         return sqlite3_vfs_register(wrapper, 0)

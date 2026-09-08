@@ -15,7 +15,7 @@ Storage/
 ├── ImageExtractor.swift         # Video frame extraction and generator cache
 ├── StorageModuleError.swift     # Module-local errors
 ├── CloudSync/
-│   └── SyncManifest.swift       # CLI-state-only chunk revisions and snapshot lineage; no app database writes
+│   └── SyncManifest.swift       # CLI-state-only revisions, deletion ledger and snapshot lineage; no app database writes
 ├── WAL/
 │   ├── WALManager.swift
 │   └── RecoveryManager.swift
@@ -27,7 +27,7 @@ Storage/
 │   └── FrameConverter.swift     # Pixel format conversion
 └── Tests/
     ├── StorageManagerTests.swift
-    ├── SyncManifestTests.swift  # CRUD/revisions/reopen, snapshot lineage migration and state-root safety
+    ├── SyncManifestTests.swift  # CRUD/revisions/deletion/reopen, lineage migration and state-root safety
     ├── DirectoryManagerTests.swift
     ├── TestLogger.swift
     └── HEVCEncoderTests.swift
@@ -322,8 +322,9 @@ The CLI is the manifest's only consumer; it imports Storage for this local state
 The manifest uses the existing SQLCipher package without an encryption key and lives
 only in the independent CLI state root, never in app storage. Dry runs open it
 read-only and do not create it. B2 networking and upload policy remain CLI concerns;
-Local database snapshots and lineage are implemented by the CLI; media recovery,
-privacy deletion, and cloud encryption remain pending gates.
+Local database snapshots, lineage and a durable deletion-intent ledger are implemented
+by the CLI. Ledger keys remain suppressed after local acknowledgement; provider-version
+and snapshot purge execution, media recovery and cloud encryption remain pending gates.
 
 - **Input from**: CAPTURE module (CapturedFrame to encode and store)
 - **Output to**: UI (frame data for playback), DATABASE (VideoSegment metadata via App layer)

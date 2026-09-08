@@ -61,12 +61,12 @@ retrace/
 ├── Sources/
 │   ├── RetraceCLI/              # Evidence, local sync planning and database recovery executable `retrace-cli`
 │   │   ├── RetraceCLI.swift     # Noninteractive entry point
-│   │   ├── CLICommand.swift     # JSON/JSONL contracts, metrics, evidence/sync/snapshot/verify/restore routing
-│   │   ├── SourceDatabase.swift # Native schema/aggregate SELECTs, strict read-only source VFS
+│   │   ├── CLICommand.swift     # JSON/JSONL contracts, metrics, evidence/sync/purge/snapshot/verify/restore routing
+│   │   ├── SourceDatabase.swift # Native schema/aggregate/visible-day purge SELECTs, strict read-only source VFS
 │   │   ├── ChunkInventory.swift # Bounded descriptor-relative metadata inventory
 │   │   ├── CLIStateMetrics.swift # Independent CLI-owned daily_metrics SQLite store
 │   │   ├── B2Client.swift       # Disabled-by-default B2 Native API shell with injectable transport
-│   │   ├── SyncPlanner.swift    # Read-only chunk hashing and revision planning; uploads disabled
+│   │   ├── SyncPlanner.swift    # Read-only chunk hashing/revision planning and pending-purge suppression; uploads disabled
 │   │   ├── SnapshotStore.swift  # SQLite online backup, lineage verification, and empty-target restore
 │   │   └── Tests/RetraceCLITests.swift # Temporary SQLite/FileManager contract fixtures
 │   ├── TestMostRecentFrame/     # Existing diagnostic executable
@@ -129,9 +129,9 @@ retrace/
 │   ├── VideoEncoder/            # HEVC video encoding
 │   ├── WAL/                     # Write-Ahead Log (WALManager, RecoveryManager)
 │   ├── CloudSync/
-│   │   └── SyncManifest.swift   # Transactional chunk revisions and snapshot lineage in CLI state only
+│   │   └── SyncManifest.swift   # Transactional chunk revisions, deletion ledger and snapshot lineage in CLI state only
 │   └── Tests/
-│       └── SyncManifestTests.swift # SQLite revision/reopen, snapshot lineage migration and state safety fixtures
+│       └── SyncManifestTests.swift # SQLite revision/deletion/reopen, lineage migration and state safety fixtures
 │
 ├── Capture/                     # CGWindowListCapture integration
 │   ├── AGENTS.md

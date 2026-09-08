@@ -133,6 +133,11 @@ struct ChunkInventory: Encodable, Sendable {
         return result
     }
 
+    static func isCanonicalKey(_ key: String) -> Bool {
+        let parts = key.components(separatedBy: "/")
+        return parts.count == 4 && parts[0] == "chunks" && validDay(month: parts[1], day: parts[2]) && validVideoID(parts[3])
+    }
+
     private static func validVideoID(_ name: String) -> Bool {
         guard let id = Int64(name), id > 0 else { return false }
         return String(id) == name

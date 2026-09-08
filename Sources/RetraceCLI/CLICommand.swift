@@ -48,6 +48,21 @@ private struct CLIExportSummary: Encodable {
     var error: CLIError?
 }
 
+private struct CLIPurgeReport: Encodable {
+    let schemaVersion = 1
+    let command: String
+    var status = "complete"
+    var exitCode: Int32 = 0
+    var elapsedMs: Double = 0
+    var purgeDay: String?
+    var frameCount = 0
+    var affectedKeys: [String] = []
+    var recordedDeletions = 0
+    var appliedLocal = 0
+    let note = "Ledger acknowledgement only; no file deletion. Local deletion remains the app retention path. Cloud propagation executes when uploads are enabled and must delete every prior version; local acknowledgement does not clear upload suppression."
+    var error: CLIError?
+}
+
 enum CLICommand {
     // Keep the human explanation in the executable so the JSON contract travels with it.
     private static let help = [
@@ -55,19 +70,24 @@ enum CLICommand {
         "swift run retrace-cli status [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli baseline [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli sync --dry-run [--storage-root PATH] [--state-root PATH]",
+        "swift run retrace-cli sync-plan --purge-day YYYY-MM-DD [--storage-root PATH] [--state-root PATH]",
+        "swift run retrace-cli purge-apply --day YYYY-MM-DD [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli snapshot [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli verify --snapshot PATH [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli restore --snapshot PATH --to DIR [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli export --day YYYY-MM-DD [--storage-root PATH] [--state-root PATH] [--limit N]",
         "Build: swift build --product retrace-cli -j 4. Executable: .build/debug/retrace-cli. The installed command alias retrace is a later packaging step; the existing app product Retrace is separate.",
-        "stdout: one JSON object for help/status/baseline/sync/snapshot/verify/restore, schemaVersion=1; diagnostics: stderr. Export streams JSONL frames to stdout and one summary JSON object to stderr, including on failure. No prompts or application startup.",
+        "stdout: one JSON object for help/status/baseline/sync/sync-plan/purge-apply/snapshot/verify/restore, schemaVersion=1; diagnostics: stderr. Export streams JSONL frames to stdout and one summary JSON object to stderr, including on failure. No prompts or application startup.",
         "Exit codes: 0 complete, 2 invalid arguments/unsafe state path, 3 unavailable or unsupported source/manifest, 4 partial inventory/plan, 5 metrics/output failure, 6 upload_disabled.",
         "Sync is local planning only: without --dry-run it exits 6 (upload_disabled). Privacy-deletion, cloud snapshot recovery and encryption contracts remain pending: docs/decomposition/optimization-and-cloud-sync.md, Plan gates before implementation continues.",
         "Snapshot uses SQLite online backup from the read-only source connection into CLI state snapshots/<utc-ms>.db, including committed WAL rows. It pins a read transaction, copies 256 pages per step with bounded lock retries, and writes a standalone DELETE-mode database. It checks integrity, streams SHA-256 and records physical frame/video counts and lineage in sync-manifest.db. stdout includes absolute snapshotPath, sha256, sizeBytes, frameCount, videoCount, integrity, lineageId and elapsedMs.",
         "Verify recomputes integrity/counts/SHA-256 without writing the snapshot or manifest. The latest lineage for the snapshot path takes precedence; SHA-256 fallback supports moved copies. checks reports match/mismatch/unavailable per field and missing for an absent manifest row. Any mismatch, unavailable field or missing lineage exits 3. SQLite corruption still reports the hash comparison when the bytes are readable.",
         "Restore copies a standalone snapshot into an empty --to directory as retrace.db, then checks it read-only. A missing target is created. Nonempty targets, symlink components, hardlinked snapshots and source-contained paths are refused. --storage-root identifies the protected source for verify/restore and defaults to configured app storage; --state-root selects independent metrics/lineage state. Restore does not require lineage. Snapshots contain the whole database, including OCR; only metadata is printed. Media files, cloud recovery, encrypted sources and retention are outside this local database-only slice.",
         "Sync hashes canonical nonempty chunks with SHA-256 and B2 SHA-1 in 1 MiB reads. It reads sync-manifest.db in CLI state without creating or writing it. Only independent command metrics are written. No source database, credentials, Keychain or network are accessed.",
-        "Sync stdout is one schemaVersion=1 JSON object: wouldUpload (new/pending), wouldReupload (changed SHA-256, revision+1), unchangedCount (already uploaded), bytesTotal/objectsTotal (all successfully hashed candidates), noncanonical/incomplete/symlink counts, errors and elapsedMs. Object keys are relative canonical chunk paths; no file contents are emitted. The scan is bounded to 100000 entries and 10 seconds, including checks between 1 MiB reads. Filesystem calls can exceed that bound. Plans are observational, not a backup recovery point or proof of finalized media.",
+        "Sync stdout is one schemaVersion=1 JSON object: wouldUpload (new/pending), wouldReupload (changed SHA-256, revision+1), unchangedCount (already uploaded), bytesTotal/objectsTotal (successfully hashed, unsuppressed candidates), suppressedPendingPurges (number of suppressed canonical nonempty files encountered), purgeKeysAffected (their sorted keys), noncanonical/incomplete/symlink counts, errors and elapsedMs. Purged keys are skipped before hashing and checked again after scanning. Object keys are relative canonical chunk paths; no file contents are emitted. The scan is bounded to 100000 entries and 10 seconds, including checks between 1 MiB reads. Filesystem calls can exceed that bound. Plans are observational, not a backup recovery point or proof of finalized media.",
+        "sync-plan --purge-day records durable deletion intent in independent sync-manifest.db; this command writes ledger rows. It uses export's strict local day and visible-frame rules, including redacted frames. At most 50000 visible frames are resolved, with one lookahead; exceeding the bound or failing to resolve a key fails before recording any rows. JSON includes purgeDay, frameCount, affectedKeys (sorted canonical chunk keys), recordedDeletions (new rows only), status and note. Repeating a day reuses key/reason rows and resets their appliedLocal acknowledgement to 0.",
+        "Purge keys use video.path (or relativePath when present), preserving the segment creation day and actual filename even when the DB video ID or frame day differs. Without a stored path, only plausible epoch-millisecond video IDs (2000...9999) use DirectoryManager's Calendar.current creation-day format; small sequence IDs or invalid/conflicting paths fail closed. The fallback assumes the original creation timezone/calendar. Frames without a video reference count toward frameCount but have no chunk key. Missing chunk files still receive ledger intent.",
+        "purge-apply --day marks only that day's previously recorded ledger rows appliedLocal=1; no file deletion. Local deletion remains the app retention path. It resolves the day from ledger reasons, so source rows/files may already be gone. Cloud propagation executes when uploads are enabled and must delete every version. Local acknowledgement never clears pending cloud purges or upload suppression. Snapshot/provider-version/cache deletion remains a future gate; no cloud deletion is executed here.",
         "Storage defaults to Shared.AppPaths configured root; only an existing retrace.db is opened read-only. Paths may be relative or use ~; empty, memory and URI paths are rejected.",
         "Status counts native frame/video/node rows and frame timestamp coverage in Unix milliseconds. These are aggregate physical rows, including hidden/redacted rows, not a visibility-aware export API.",
         "Export requires a real date in strict YYYY-MM-DD format. It reads the local-calendar day, including its start and excluding next midnight, hidden segments, unsegmented frames, and deletion rewrites. Redacted frames remain visible. Rows are ordered by timestamp then frame ID; no OCR text or media paths are exported.",
@@ -87,6 +107,9 @@ enum CLICommand {
         // on a worker even when the command runner is called from another async context.
         await Task.detached {
             if arguments.first == "sync" { return await executeSync(arguments: Array(arguments.dropFirst())) }
+            if let command = arguments.first, ["sync-plan", "purge-apply"].contains(command) {
+                return await executePurge(command: command, arguments: Array(arguments.dropFirst()))
+            }
             if arguments.first == "export" { return executeExport(arguments: Array(arguments.dropFirst()), writeFrame: writeFrame) }
             if let command = arguments.first, ["snapshot", "verify", "restore"].contains(command) {
                 return await executeSnapshotCommand(command: command, arguments: Array(arguments.dropFirst()))
@@ -101,7 +124,7 @@ enum CLICommand {
         var metrics: CLIStateMetrics?
         do {
             guard let command = arguments.first, ["help", "status", "baseline"].contains(command) else {
-                throw CLIError("usage", "Use swift run retrace-cli help, status, baseline, export, sync --dry-run, snapshot, verify, or restore.", exitCode: 2)
+                throw CLIError("usage", "Use swift run retrace-cli help, status, baseline, export, sync --dry-run, sync-plan --purge-day, purge-apply --day, snapshot, verify, or restore.", exitCode: 2)
             }
             report.command = command
             if command == "help" {
@@ -191,6 +214,82 @@ enum CLICommand {
                 report.status = "failed"
                 report.exitCode = 5
                 report.error = CLIError("metrics_unavailable", "Could not persist sync outcome in independent CLI state.", exitCode: 5)
+            }
+        }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            var bytes = try encoder.encode(report)
+            bytes.append(0x0A)
+            return CLIResult(stdout: bytes, stderr: report.error.map { "retrace-cli: \($0.code): \($0.message)\n" } ?? "", exitCode: report.exitCode)
+        } catch {
+            return CLIResult(stdout: Data("{\"schemaVersion\":1,\"status\":\"failed\",\"exitCode\":5,\"error\":{\"code\":\"output_failed\"}}\n".utf8),
+                             stderr: "retrace-cli: output_failed: JSON encoding failed.\n", exitCode: 5)
+        }
+    }
+
+    private static func executePurge(command: String, arguments: [String]) async -> CLIResult {
+        let started = ProcessInfo.processInfo.systemUptime
+        var report = CLIPurgeReport(command: command)
+        var metrics: CLIStateMetrics?
+        do {
+            let options = try parseOptions(arguments, purgeCommand: command)
+            guard let label = options[command == "sync-plan" ? "--purge-day" : "--day"] else { throw usage() }
+            let day: Date
+            do { day = try parseDay(label) } catch { throw usage() }
+            report.purgeDay = label
+            let root = try localPath(options["--storage-root"] ?? AppPaths.storageRoot).resolvingSymlinksInPath()
+            let state = try localPath(options["--state-root"] ?? "~/Library/Application Support/RetraceCLI")
+            metrics = try CLIStateMetrics(root: state, sourceRoot: root)
+            try metrics?.record(command: command, outcome: "started")
+            // Complete every bounded source read before the ledger transaction. Apply
+            // deliberately consults only recorded intent: retention may have run already.
+            let evidence: SourceDatabase.PurgeEvidence?
+            if command == "sync-plan" {
+                evidence = try SourceDatabase.withConnection(root: root, allowMissingVideoPath: true) {
+                    try SourceDatabase.purgeEvidence($0, config: .retrace(storageRoot: root.path), day: day)
+                }
+            } else { evidence = nil }
+            let manifest = try await SyncManifest.open(root: state, sourceRoot: root)
+            do {
+                let reason = "purge-day:\(label)"
+                let recordedKeys = try await manifest.deletionKeys(reason: reason)
+                let keys = recordedKeys.union(evidence?.keys ?? []).sorted()
+                if let evidence {
+                    report.recordedDeletions = try await manifest.recordPendingDeletions(keys: keys, reason: reason)
+                    report.frameCount = evidence.frameCount
+                } else {
+                    report.appliedLocal = try await manifest.markAppliedLocal(keys: keys, reason: reason)
+                }
+                report.affectedKeys = keys
+                try await manifest.close()
+            } catch {
+                try? await manifest.close()
+                throw error
+            }
+        } catch {
+            let failure: CLIError
+            if let cliError = error as? CLIError { failure = cliError }
+            else if error as? SyncManifestError == .unsafeStateRoot {
+                failure = CLIError("unsafe_state_root", "Purge ledger state must be outside source storage without symlink or hardlink aliases.", exitCode: 2)
+            } else if error is SyncManifestError {
+                failure = CLIError("manifest_unavailable", "Could not read or persist the deletion ledger; purge suppression fails closed.")
+            } else {
+                failure = CLIError("database_unreadable", "Could not read source evidence; no deletion rows were recorded.")
+            }
+            report.status = "failed"
+            report.exitCode = failure.exitCode
+            report.error = failure
+        }
+        report.elapsedMs = max(0, (ProcessInfo.processInfo.systemUptime - started) * 1000)
+        if let metrics {
+            do {
+                try metrics.record(command: command, outcome: report.status == "complete" ? "succeeded" : "failed",
+                                   durationMs: report.elapsedMs, errorCode: report.error?.code)
+            } catch {
+                report.status = "failed"
+                report.exitCode = 5
+                report.error = CLIError("metrics_unavailable", "Could not persist purge command outcome in independent CLI state.", exitCode: 5)
             }
         }
         do {
@@ -354,10 +453,13 @@ enum CLICommand {
     }
 
     private static func parseOptions(_ arguments: [String], export: Bool = false, sync: Bool = false,
-                                     snapshotCommand: String? = nil) throws -> [String: String] {
-        let allowed = ["--storage-root", "--state-root"] + (export ? ["--day", "--limit"] : [])
-            + (snapshotCommand == "verify" || snapshotCommand == "restore" ? ["--snapshot"] : [])
-            + (snapshotCommand == "restore" ? ["--to"] : [])
+                                     snapshotCommand: String? = nil, purgeCommand: String? = nil) throws -> [String: String] {
+        var allowed = ["--storage-root", "--state-root"]
+        if export { allowed += ["--day", "--limit"] }
+        if snapshotCommand == "verify" || snapshotCommand == "restore" { allowed.append("--snapshot") }
+        if snapshotCommand == "restore" { allowed.append("--to") }
+        if purgeCommand == "sync-plan" { allowed.append("--purge-day") }
+        if purgeCommand == "purge-apply" { allowed.append("--day") }
         var values: [String: String] = [:]
         var index = 0
         while index < arguments.count {

@@ -508,6 +508,247 @@ final class RetraceCLITests: XCTestCase {
         XCTAssertFalse(metric.contains("chunks/"))
     }
 
+    private func initializePurgeEvidence() async throws -> [String] {
+        try await initializeEvidence()
+        let keys = ["chunks/202603/07/1772928000000", "chunks/202603/08/1773014400000"]
+        for key in keys + ["chunks/202603/08/99"] {
+            let file = root.appendingPathComponent(key)
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("fixture chunk".utf8).write(to: file)
+        }
+        let db = try openFixture()
+        defer { sqlite3_close(db) }
+        try exec(db, """
+            UPDATE video SET path='\(keys[0])' WHERE id=7;
+            INSERT INTO video(id,height,width,path,frameRate,processingState) VALUES(8,100,100,'\(keys[1])',0.5,0),
+                (9,100,100,'chunks/202603/08/99',0.5,0);
+            INSERT INTO frame(id,createdAt,imageFileName,segmentId,videoId,videoFrameIndex,rewritePurpose)
+            VALUES(1,\(exportStartMs),'',1,7,0,NULL),(2,\(exportStartMs + 1),'',1,7,1,'redaction'),
+                  (3,\(exportStartMs + 2),'',1,8,0,NULL),(4,\(exportStartMs + 3),'',2,9,0,NULL),
+                  (5,\(exportStartMs + 4),'',1,9,1,'deletion'),(6,\(exportStartMs - 1),'',1,9,2,NULL),
+                  (7,\(exportStartMs + 5),'',NULL,9,3,NULL),(8,\(exportStartMs + 6),'',1,NULL,0,NULL);
+            """)
+        return keys
+    }
+
+    func testPurgeDayUsesVisibleFramesAndStoredChunkCreationPathsWithoutSourceWrites() async throws {
+        let keys = try await initializePurgeEvidence()
+        let before = try sourceFingerprint()
+        let result = await run("sync-plan", extra: ["--purge-day", exportDay])
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        let report = try json(result)
+        XCTAssertEqual(report["purgeDay"] as? String, exportDay)
+        XCTAssertEqual(report["frameCount"] as? Int, 4)
+        XCTAssertEqual(report["affectedKeys"] as? [String], keys)
+        XCTAssertEqual(report["recordedDeletions"] as? Int, 2)
+        XCTAssertEqual(try sourceFingerprint(), before)
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: root, readOnly: true)
+        let pending = try await manifest.pendingDeletionKeys()
+        XCTAssertEqual(pending, Set(keys))
+        try await manifest.close()
+    }
+
+    func testPurgeRepeatResetsLocalAcknowledgementAndApplyUsesRecordedDayAfterSourceRemoval() async throws {
+        let keys = try await initializePurgeEvidence()
+        let first = await run("sync-plan", extra: ["--purge-day", exportDay])
+        XCTAssertEqual(first.exitCode, 0, first.stderr)
+        let before = try sourceFingerprint()
+        let applied = await run("purge-apply", extra: ["--day", exportDay])
+        XCTAssertEqual(applied.exitCode, 0, applied.stderr)
+        XCTAssertEqual(try json(applied)["appliedLocal"] as? Int, 2)
+        XCTAssertEqual(try sourceFingerprint(), before)
+        let repeated = await run("sync-plan", extra: ["--purge-day", exportDay])
+        XCTAssertEqual(repeated.exitCode, 0, repeated.stderr)
+        XCTAssertEqual(try json(repeated)["recordedDeletions"] as? Int, 0)
+        XCTAssertEqual(try stateScalar("SELECT count(*) FROM deletions"), 2)
+        XCTAssertEqual(try stateScalar("SELECT sum(appliedLocal) FROM deletions"), 0)
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: root)
+        _ = try await manifest.recordPendingDeletions(keys: [keys[0]], reason: "purge-day:2026-03-09")
+        try await manifest.close()
+        try FileManager.default.removeItem(at: database) // Simulates app retention after recording intent.
+        let afterRetention = await run("purge-apply", extra: ["--day", exportDay])
+        XCTAssertEqual(afterRetention.exitCode, 0, afterRetention.stderr)
+        XCTAssertEqual(try stateScalar("SELECT sum(appliedLocal) FROM deletions WHERE reason='purge-day:2026-03-08'"), 2)
+        XCTAssertEqual(try stateScalar("SELECT sum(appliedLocal) FROM deletions WHERE reason='purge-day:2026-03-09'"), 0)
+        let plan = try json(await run("sync", extra: ["--dry-run"]))
+        XCTAssertEqual(plan["purgeKeysAffected"] as? [String], keys)
+        XCTAssertEqual(plan["suppressedPendingPurges"] as? Int, 2)
+    }
+
+    func testSyncSuppressesNewQueuedAndRewrittenPurgesWithoutManifestWrites() async throws {
+        let keys = try await initializePurgeEvidence()
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: root)
+        _ = try await manifest.record(key: keys[0], sha256: String(repeating: "a", count: 64), sizeBytes: 3, mtimeNs: 1)
+        try await manifest.markUploaded(key: keys[0], revision: 1, uploadedAt: 1, contentTag: "prior-version")
+        _ = try await manifest.recordPendingDeletions(keys: keys, reason: "fixture")
+        try await manifest.close()
+        let before = try Data(contentsOf: state.appendingPathComponent(SyncManifest.filename))
+        let sourceBefore = try sourceFingerprint()
+        let result = await run("sync", extra: ["--dry-run"])
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        let report = try json(result)
+        XCTAssertEqual(report["suppressedPendingPurges"] as? Int, 2)
+        XCTAssertEqual(report["purgeKeysAffected"] as? [String], keys)
+        XCTAssertEqual((report["wouldReupload"] as? [Any])?.count, 0)
+        XCTAssertEqual((report["wouldUpload"] as? [[String: Any]])?.compactMap { $0["key"] as? String }, ["chunks/202603/08/99"])
+        XCTAssertEqual(report["objectsTotal"] as? Int, 1)
+        XCTAssertEqual(report["bytesTotal"] as? Int, 13)
+        XCTAssertEqual(try Data(contentsOf: state.appendingPathComponent(SyncManifest.filename)), before)
+        XCTAssertEqual(try sourceFingerprint(), sourceBefore)
+    }
+
+    func testPurgeStrictOptionsEmptyDaysAndCommandMetrics() async throws {
+        for (command, flag) in [("sync-plan", "--purge-day"), ("purge-apply", "--day")] {
+            for options in [[], [flag], [flag, "2026-02-30"], [flag, "2026-3-08"],
+                            [flag, exportDay, flag, exportDay], [flag, exportDay, "--dry-run"]] {
+                try assertError(await run(command, extra: options), "usage")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.path))
+        try await initializeEvidence()
+        for (command, flag) in [("sync-plan", "--purge-day"), ("purge-apply", "--day")] {
+            let result = await run(command, extra: [flag, "2024-02-29"])
+            XCTAssertEqual(result.exitCode, 0, result.stderr)
+            XCTAssertEqual(try json(result)["affectedKeys"] as? [String], [])
+        }
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(state.appendingPathComponent("metrics.db").path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT metadata FROM daily_metrics ORDER BY id", -1, &statement, nil), SQLITE_OK)
+        for command in ["sync-plan", "purge-apply"] {
+            for outcome in ["started", "succeeded"] {
+                XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+                let bytes = Data(String(cString: sqlite3_column_text(statement, 0)).utf8)
+                let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+                XCTAssertEqual(metadata["command"] as? String, command)
+                XCTAssertEqual(metadata["outcome"] as? String, outcome)
+                XCTAssertTrue(Set(metadata.keys).isSubset(of: ["command", "outcome", "durationMs"]))
+            }
+        }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+        let help = try json(await CLICommand.run(arguments: ["help"]))
+        let lines = try XCTUnwrap(help["help"] as? [String]).joined(separator: "\n")
+        XCTAssertTrue(lines.contains("purge-apply --day"))
+        XCTAssertTrue(lines.contains("no file deletion"))
+    }
+
+    func testCorruptDeletionLedgerFailsClosedForPlanRecordAndApply() async throws {
+        _ = try await initializePurgeEvidence()
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: root)
+        try await manifest.close()
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(state.appendingPathComponent(SyncManifest.filename).path, &db), SQLITE_OK)
+        try exec(try XCTUnwrap(db), "ALTER TABLE deletions RENAME COLUMN objectKey TO broken")
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let before = try sourceFingerprint()
+        for (command, flags) in [("sync", ["--dry-run"]), ("sync-plan", ["--purge-day", exportDay]), ("purge-apply", ["--day", exportDay])] {
+            let result = await run(command, extra: flags)
+            try assertError(result, "manifest_unavailable")
+            XCTAssertEqual(result.exitCode, 3)
+            let report = try json(result)
+            XCTAssertTrue((report["wouldUpload"] as? [Any] ?? []).isEmpty)
+            XCTAssertTrue((report["wouldReupload"] as? [Any] ?? []).isEmpty)
+        }
+        XCTAssertEqual(try sourceFingerprint(), before)
+    }
+
+    private func stateScalar(_ sql: String) throws -> Int64 {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(state.appendingPathComponent(SyncManifest.filename).path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_prepare_v2(db, sql, -1, &statement, nil), SQLITE_OK)
+        _ = try XCTUnwrap(statement)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        return sqlite3_column_int64(statement, 0)
+    }
+
+    func testPurgeUsesRelativePathAndPathlessTimestampIDsWithoutInventingSequenceDates() async throws {
+        try await initializeEvidence()
+        try insertEvidence(1, timestampMs: exportStartMs)
+        let db = try openFixture()
+        let key = "chunks/202603/07/1772928000000"
+        try exec(db, "UPDATE video SET path='\(key)'; ALTER TABLE video RENAME COLUMN path TO relativePath")
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let relative = await run("sync-plan", extra: ["--purge-day", exportDay])
+        XCTAssertEqual(relative.exitCode, 0, relative.stderr)
+        XCTAssertEqual(try json(relative)["affectedKeys"] as? [String], [key], "Absent chunks still need remote deletion intent")
+        let writer = try openFixture()
+        try exec(writer, "ALTER TABLE video DROP COLUMN relativePath")
+        XCTAssertEqual(sqlite3_close(writer), SQLITE_OK)
+        let before = try Data(contentsOf: state.appendingPathComponent(SyncManifest.filename))
+        try assertError(await run("sync-plan", extra: ["--purge-day", exportDay]), "purge_evidence_unavailable")
+        XCTAssertEqual(try Data(contentsOf: state.appendingPathComponent(SyncManifest.filename)), before)
+
+        let timestampID = exportStartMs + 3_600_000
+        let timestampKey = "chunks/202603/08/\(timestampID)"
+        let updater = try openFixture()
+        try exec(updater, "UPDATE video SET id=\(timestampID); UPDATE frame SET videoId=\(timestampID)")
+        XCTAssertEqual(sqlite3_close(updater), SQLITE_OK)
+        let file = root.appendingPathComponent(timestampKey)
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("fixture".utf8).write(to: file)
+        let sourceBefore = try sourceFingerprint()
+        let fallback = await run("sync-plan", extra: ["--purge-day", exportDay])
+        XCTAssertEqual(fallback.exitCode, 0, fallback.stderr)
+        XCTAssertEqual(try json(fallback)["affectedKeys"] as? [String], [key, timestampKey].sorted())
+        XCTAssertEqual(try sourceFingerprint(), sourceBefore)
+    }
+
+    func testPurgeRejectsAmbiguousPathsAndOversizedDaysBeforeRecordingAnything() async throws {
+        _ = try await initializePurgeEvidence()
+        let writer = try openFixture()
+        try exec(writer, "UPDATE video SET path='../chunks/202603/07/7' WHERE id=7")
+        XCTAssertEqual(sqlite3_close(writer), SQLITE_OK)
+        try assertError(await run("sync-plan", extra: ["--purge-day", exportDay]), "purge_evidence_unavailable")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.appendingPathComponent(SyncManifest.filename).path))
+        let db = try openFixture()
+        try exec(db, """
+            UPDATE video SET path='chunks/202603/07/7' WHERE id=7;
+            WITH RECURSIVE ids(id) AS (SELECT 100 UNION ALL SELECT id+1 FROM ids WHERE id<50100)
+            INSERT INTO frame(id,createdAt,imageFileName,segmentId,videoId,videoFrameIndex)
+            SELECT id,\(exportStartMs),'',1,7,id FROM ids;
+            """)
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let before = try sourceFingerprint()
+        let result = await run("sync-plan", extra: ["--purge-day", exportDay])
+        try assertError(result, "purge_day_limit")
+        XCTAssertEqual(result.exitCode, 4)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.appendingPathComponent(SyncManifest.filename).path))
+        XCTAssertEqual(try sourceFingerprint(), before)
+    }
+
+    func testPurgeReadsCommittedWALAndFailsWithoutMissingSidecarRepair() async throws {
+        _ = try await initializePurgeEvidence()
+        let writer = try openFixture()
+        try exec(writer, "PRAGMA journal_mode=WAL; UPDATE video SET path='chunks/202603/06/777' WHERE id=7")
+        let before = try sourceFingerprint()
+        let result = await run("sync-plan", extra: ["--purge-day", exportDay])
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        XCTAssertEqual(try json(result)["affectedKeys"] as? [String], ["chunks/202603/06/777", "chunks/202603/08/1773014400000"])
+        XCTAssertEqual(try sourceFingerprint(), before)
+        XCTAssertEqual(sqlite3_close(writer), SQLITE_OK)
+        let afterCheckpoint = try sourceFingerprint()
+        let ledgerBefore = try Data(contentsOf: state.appendingPathComponent(SyncManifest.filename))
+        try assertError(await run("sync-plan", extra: ["--purge-day", exportDay]), "database_unreadable")
+        XCTAssertEqual(try sourceFingerprint(), afterCheckpoint)
+        XCTAssertEqual(try Data(contentsOf: state.appendingPathComponent(SyncManifest.filename)), ledgerBefore)
+    }
+
+    private func sourceFingerprint() throws -> [String: Data] {
+        let files = try XCTUnwrap(FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey]))
+        var result: [String: Data] = [:]
+        for case let file as URL in files {
+            if try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true {
+                result[file.path] = try Data(contentsOf: file)
+            }
+        }
+        return result
+    }
+
     func testSyncExcludesZeroBytesNoncanonicalNamesAndSymlinks() async throws {
         let day = root.appendingPathComponent("chunks/202402/29")
         try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)

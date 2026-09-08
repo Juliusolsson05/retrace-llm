@@ -95,6 +95,8 @@ struct SyncPlan: Encodable, Sendable {
     var exitCode: Int32 = 0
     var wouldUpload: [Object] = []
     var wouldReupload: [Object] = []
+    var suppressedPendingPurges = 0
+    var purgeKeysAffected: [String] = []
     var unchangedCount = 0
     var bytesTotal: Int64 = 0
     var objectsTotal = 0
@@ -114,15 +116,23 @@ enum SyncPlanner {
     static func plan(root: URL, state: URL, maxEntries: Int = 100_000, maxSeconds: Double = 10) async throws -> SyncPlan {
         let manifest = try await SyncManifest.open(root: state, sourceRoot: root, readOnly: true)
         do {
-            let (inventory, candidates) = await Task.detached {
+            let purged = try await manifest.pendingDeletionKeys()
+            let (inventory, candidates, skipped) = await Task.detached {
                 var candidates: [(String, SyncFileHasher.Digest)] = []
+                var skipped: Set<String> = []
                 let deadline = ProcessInfo.processInfo.systemUptime + maxSeconds
                 let inventory = ChunkInventory.scanSynchronously(root: root, maxEntries: maxEntries, maxSeconds: maxSeconds) { fd, name, key, attributes in
+                    // Suppress before opening bytes, even if a purged file is unreadable.
+                    if purged.contains(key) { skipped.insert(key); return }
                     let digest = try SyncFileHasher.hash(directory: fd, name: name, expected: attributes, deadline: deadline)
                     candidates.append((key, digest))
                 }
-                return (inventory, candidates)
+                return (inventory, candidates, skipped)
             }.value
+            // A purge recorded while hashing also wins. Plans remain observational;
+            // future transfers must use the manifest's transactional queue/ack guards.
+            let latestPurges = try await manifest.pendingDeletionKeys().union(purged)
+            var suppressed = skipped
             var result = SyncPlan()
             result.status = inventory.status
             result.incompleteFileCount = inventory.incompleteFileCount
@@ -134,6 +144,7 @@ enum SyncPlanner {
             result.visitedEntries = inventory.visitedEntries
             result.errors = inventory.errors
             for (key, digest) in candidates.sorted(by: { $0.0 < $1.0 }) {
+                if latestPurges.contains(key) { suppressed.insert(key); continue }
                 let previous = try await manifest.lookup(key: key)
                 let changed = previous.map { $0.sha256 != digest.sha256 } ?? false
                 var revision = previous?.revision ?? 1
@@ -150,6 +161,8 @@ enum SyncPlanner {
                 result.bytesTotal = total.partialValue
                 result.objectsTotal += 1
             }
+            result.purgeKeysAffected = suppressed.sorted()
+            result.suppressedPendingPurges = suppressed.count
             try await manifest.close()
             if result.status == "partial" {
                 result.exitCode = 4
