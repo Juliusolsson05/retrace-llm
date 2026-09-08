@@ -1,7 +1,15 @@
 import Foundation
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
 import Database
 import Shared
 import Storage
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 struct CLIResult: Sendable {
     let stdout: Data
@@ -65,6 +73,41 @@ private struct CLIPurgeReport: Encodable {
     var error: CLIError?
 }
 
+private struct CLIFrameReport: Encodable {
+    struct Video: Encodable { var videoId: Int64; var videoFrameIndex: Int?; var chunkKey: String; var frameRate: Double? }
+    struct Segment: Encodable {
+        var segmentId: Int64; var appBundleId: String?; var appName: String?; var windowName: String?; var browserUrl: String?
+        private enum CodingKeys: String, CodingKey { case segmentId, appBundleId, appName, windowName, browserUrl }
+        // appName matches export's DataAdapter suffix semantics: derived, never a display-name lookup.
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(segmentId, forKey: .segmentId)
+            try container.encode(appBundleId, forKey: .appBundleId)
+            try container.encodeIfPresent(appBundleId?.components(separatedBy: ".").last, forKey: .appName)
+            try container.encodeIfPresent(windowName, forKey: .windowName)
+            try container.encodeIfPresent(browserUrl, forKey: .browserUrl)
+        }
+    }
+    struct OCRRegion: Encodable { var nodeOrder: Int; var text: String; var leftX: Double; var topY: Double; var width: Double; var height: Double; var windowIndex: Int? }
+    struct ExtractedImage: Encodable { var pngPath: String; var byteCount: Int }
+
+    let schemaVersion = 1
+    let command = "frame"
+    var status = "complete"
+    var exitCode: Int32 = 0
+    var elapsedMs = 0.0
+    var frameId: Int64?
+    var timestampMs: Int64?
+    var textAvailable: Bool?
+    var video: Video?
+    var segment: Segment?
+    var ocrRegionCount = 0
+    var encryptedRegionCount = 0
+    var ocrRegions: [OCRRegion] = []
+    var image: ExtractedImage?
+    var error: CLIError?
+}
+
 enum CLICommand {
     // Keep the human explanation in the executable so the JSON contract travels with it.
     private static let help = [
@@ -73,6 +116,7 @@ enum CLICommand {
         "swift run retrace-cli baseline [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli baseline --session SECONDS [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli baseline --harvest-log [PATH] [--storage-root PATH] [--state-root PATH]",
+        "swift run retrace-cli frame --frame-id N [--png PATH] [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli sync --dry-run [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli sync --apply --phrase-from-stdin [--snapshot-current PATH] [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli sync-plan --purge-day YYYY-MM-DD [--storage-root PATH] [--state-root PATH]",
@@ -106,6 +150,7 @@ enum CLICommand {
         "Baseline also inventories chunks/YYYYMM/DD/positive-decimal-videoID (no extension). Nonempty regular files are canonical candidates; zero-byte candidates are incomplete. Other files, directories, symlinks and errors are reported separately, without individual names.",
         "Baseline --session SECONDS (1...3600) samples the running Retrace process on a 1s cadence (proc_pidinfo CPU as percent of one core, phys_footprint bytes), tails ~/Library/Logs/Retrace/retrace.log with rotation awareness, and reports the canonical chunk byte delta between the start and end scans. If Retrace is not running, process fields are null with processFound=false; sampling disappearance is evidence, never a failure. CPU percent of one core can exceed 100 with multiple busy threads.",
         "Baseline --harvest-log [PATH] parses an existing log offline (default ~/Library/Logs/Retrace/retrace.log; a missing default reports logPresent=false, a missing explicit PATH exits 3 log_unreadable). Harvested shapes mirror the production emit sites: [Queue-DIAG] Worker COMPLETED durations, [PERF] p50/p95 summaries and slow samples, and Deduplication analysis outcomes with a decile similarity histogram (n/a similarities count toward outcomes only). Lines carrying one of those markers but failing the real emit format count as malformedMetricLines and are skipped. Percentiles are nearest-rank like the app's LatencyRecorder; absent evidence encodes as JSON null, not zero.",
+        "Frame returns single-frame evidence INCLUDING OCR text and geometry — this is the inspection command, unlike export which is metadata-only by privacy design. Output: frameId, timestampMs, textAvailable (FTS ingestion can lag processing), video {videoId, videoFrameIndex, chunkKey, frameRate}, segment lineage with appName derived as export's bundle-ID suffix, and ocrRegions ordered by nodeOrder with text sliced exactly like the app's NodeQueries (SUBSTR over searchRanking_content c0||c1 via doc_segment; encrypted regions return same-length spaces and count in encryptedRegionCount). --png PATH additionally decodes the frame from its HEVC chunk read-only via the Storage extractor and writes a PNG that must live OUTSIDE the source storage root; decode failures exit 3 image_unavailable. All reads use the strict read-only source VFS; nothing in the source tree is modified.",
         "Baseline file bytes are logical sizes, not allocated disk space. Month is the validated calendar directory label, not a timestamp or timezone inference. Files may be orphaned or unfinished; baseline performs no decoding, hashing or DB-to-file reconciliation. File counts do not equal frame counts; many frames share a video.",
         "Inventory is bounded to 100000 entries and 10 seconds between metadata operations. A filesystem call itself may take longer. A limit or I/O error returns partial counts and exit 4. Missing chunks is empty only when the database has no video rows.",
         "Live results are observational, not an atomic database/filesystem snapshot. Elapsed time measures this command only, not OCR, compression or a performance improvement.",
@@ -139,8 +184,100 @@ enum CLICommand {
                arguments.dropFirst().contains(where: { $0 == "--session" || $0.hasPrefix("--session") || $0 == "--harvest-log" }) {
                 return await executeBaselineSampling(arguments: Array(arguments.dropFirst()))
             }
+            if arguments.first == "frame" { return await executeFrame(arguments: Array(arguments.dropFirst())) }
             return execute(arguments: arguments)
         }.value
+    }
+
+    private static func executeFrame(arguments: [String]) async -> CLIResult {
+        let started = ProcessInfo.processInfo.systemUptime
+        var report = CLIFrameReport()
+        var metrics: CLIStateMetrics?
+        do {
+            let options = try parseOptions(arguments, frameCommand: true)
+            guard let idText = options["--frame-id"], let frameId = Int64(idText) else { throw usage() }
+            report.frameId = frameId
+            let root = try localPath(options["--storage-root"] ?? AppPaths.storageRoot).resolvingSymlinksInPath()
+            let state = try localPath(options["--state-root"] ?? "~/Library/Application Support/RetraceCLI")
+            metrics = try CLIStateMetrics(root: state, sourceRoot: root)
+            try metrics?.record(command: "frame", outcome: "started")
+            guard let evidence = try SourceDatabase.withConnection(root: root, {
+                try SourceDatabase.frameEvidence($0, frameId: frameId)
+            }) else {
+                throw CLIError("frame_not_found", "No frame with the supplied id exists in this source database.", exitCode: 3)
+            }
+            report.timestampMs = evidence.timestampMs
+            report.textAvailable = evidence.textAvailable
+            report.video = evidence.video.map { CLIFrameReport.Video(videoId: $0.videoId, videoFrameIndex: $0.videoFrameIndex, chunkKey: $0.chunkKey, frameRate: $0.frameRate) }
+            report.segment = evidence.segment.map { CLIFrameReport.Segment(segmentId: $0.segmentId, appBundleId: $0.appBundleId, appName: nil, windowName: $0.windowName, browserUrl: $0.browserUrl) }
+            report.ocrRegionCount = evidence.regions.count
+            report.encryptedRegionCount = evidence.encryptedRegionCount
+            report.ocrRegions = evidence.regions.map { CLIFrameReport.OCRRegion(nodeOrder: $0.nodeOrder, text: $0.text, leftX: $0.leftX, topY: $0.topY, width: $0.width, height: $0.height, windowIndex: $0.windowIndex) }
+            if let png = options["--png"] {
+                report.image = try await extractFramePNG(target: try localPath(png), evidence: evidence, root: root)
+            }
+        } catch {
+            let failure = error as? CLIError ?? CLIError("frame_unavailable", "Frame evidence could not be read.", exitCode: 3)
+            report.status = "failed"
+            report.exitCode = failure.exitCode
+            report.error = failure
+        }
+        report.elapsedMs = max(0, (ProcessInfo.processInfo.systemUptime - started) * 1000)
+        if let metrics {
+            do {
+                try metrics.record(command: "frame", outcome: report.status == "complete" ? "succeeded" : report.status,
+                                   durationMs: report.elapsedMs, errorCode: report.error?.code)
+            } catch {
+                report.status = "failed"
+                report.exitCode = 5
+                report.error = CLIError("metrics_unavailable", "Could not persist frame command outcome in independent CLI state.", exitCode: 5)
+            }
+        }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            var bytes = try encoder.encode(report)
+            bytes.append(0x0A)
+            return CLIResult(stdout: bytes, stderr: report.error.map { "retrace-cli: \($0.code): \($0.message)\n" } ?? "", exitCode: report.exitCode)
+        } catch {
+            return CLIResult(stdout: Data("{\"schemaVersion\":1,\"status\":\"failed\",\"exitCode\":5,\"error\":{\"code\":\"output_failed\"}}\n".utf8),
+                             stderr: "retrace-cli: output_failed: JSON encoding failed.\n", exitCode: 5)
+        }
+    }
+
+    /// Decodes the frame's HEVC chunk read-only and writes a PNG outside the source tree.
+    private static func extractFramePNG(target: URL, evidence: SourceDatabase.FrameEvidence, root: URL) async throws -> CLIFrameReport.ExtractedImage {
+        let rootCanonical = try CLIStateMetrics.canonicalPath(root)
+        let targetCanonical = try CLIStateMetrics.canonicalPath(target)
+        guard targetCanonical != rootCanonical, !targetCanonical.hasPrefix(rootCanonical + "/") else {
+            throw CLIError("invalid_path", "--png must write outside the source storage root; extraction never modifies recordings.", exitCode: 2)
+        }
+        guard let video = evidence.video, !video.chunkKey.isEmpty else {
+            throw CLIError("image_unavailable", "This frame has no video chunk reference to decode.", exitCode: 3)
+        }
+        let chunk = root.appendingPathComponent(video.chunkKey)
+        var attributes = stat()
+        guard lstat(chunk.path, &attributes) == 0, attributes.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else {
+            throw CLIError("image_unavailable", "The frame's video chunk is missing or not a regular file.", exitCode: 3)
+        }
+        do {
+            let extractor = HEVCStorageExtractor(storageRoot: root.path)
+            let image = try await extractor.extractFrameCGImage(videoPath: chunk.path, frameIndex: video.videoFrameIndex ?? 0, frameRate: video.frameRate)
+            let data = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else {
+                throw CLIError("image_unavailable", "Decoded frame could not be encoded as PNG.", exitCode: 3)
+            }
+            CGImageDestinationAddImage(destination, image, nil)
+            guard CGImageDestinationFinalize(destination) else {
+                throw CLIError("image_unavailable", "Decoded frame could not be encoded as PNG.", exitCode: 3)
+            }
+            try (data as Data).write(to: target)
+            return CLIFrameReport.ExtractedImage(pngPath: target.path, byteCount: (data as Data).count)
+        } catch let error as CLIError {
+            throw error
+        } catch {
+            throw CLIError("image_unavailable", "Frame image could not be decoded from its video chunk.", exitCode: 3)
+        }
     }
 
     private static func executeBaselineSampling(arguments: [String]) async -> CLIResult {
@@ -573,7 +710,7 @@ enum CLICommand {
 
     static func parseOptions(_ arguments: [String], export: Bool = false, sync: Bool = false,
                              snapshotCommand: String? = nil, purgeCommand: String? = nil, keyCommand: String? = nil,
-                             baselineCommand: Bool = false) throws -> [String: String] {
+                             baselineCommand: Bool = false, frameCommand: Bool = false) throws -> [String: String] {
         var allowed = ["--storage-root", "--state-root"]
         if export { allowed += ["--day", "--limit"] }
         if sync { allowed.append("--snapshot-current") }
@@ -582,6 +719,7 @@ enum CLICommand {
         if purgeCommand == "sync-plan" { allowed.append("--purge-day") }
         if purgeCommand == "purge-apply" { allowed.append("--day") }
         if baselineCommand { allowed.append("--session") }
+        if frameCommand { allowed += ["--frame-id", "--png"] }
         var values: [String: String] = [:]
         var index = 0
         while index < arguments.count {

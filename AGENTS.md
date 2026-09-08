@@ -61,9 +61,9 @@ retrace/
 ├── Sources/
 │   ├── RetraceCLI/              # Evidence, gated encrypted sync and database recovery executable `retrace-cli`
 │   │   ├── RetraceCLI.swift     # Noninteractive entry point
-│   │   ├── CLICommand.swift     # JSON/JSONL contracts, metrics, evidence/sync/purge/snapshot/verify/restore routing
+│   │   ├── CLICommand.swift     # JSON/JSONL contracts, metrics, evidence/sync/purge/snapshot/verify/restore/frame/baseline routing
 │   │   ├── CLIKeyCommand.swift  # Explicit key init/status/rotate/unwrap, stdin recovery and secret-free metrics
-│   │   ├── SourceDatabase.swift # Native schema/aggregate/visible-day purge SELECTs, strict read-only source VFS
+│   │   ├── SourceDatabase.swift # Native schema/aggregate/visible-day purge/frame-evidence SELECTs, strict read-only source VFS
 │   │   ├── ChunkInventory.swift # Bounded descriptor-relative metadata inventory
 │   │   ├── CLIStateMetrics.swift # Independent CLI-owned daily_metrics SQLite store
 │   │   ├── B2Client.swift       # Disabled-by-default B2 Native API with injectable transport and authorization URL
@@ -73,7 +73,8 @@ retrace/
 │   │   ├── BaselineSampler.swift # Real-session process/log sampling and offline log harvesting for baseline reports
 │   │   └── Tests/
 │   │       ├── RetraceCLITests.swift # SQLite/FileManager fixtures and offline B2 upload/verify/restore cycles
-│   │       └── BaselineSamplerTests.swift # Real-emit-format log fixtures, session self-sampling and CLI mode routing
+│   │       ├── BaselineSamplerTests.swift # Real-emit-format log fixtures, session self-sampling and CLI mode routing
+│   │       └── FrameCommandTests.swift # FTS5-sliced OCR text, encrypted placeholders, lineage and PNG safety fixtures
 │   ├── TestMostRecentFrame/     # Existing diagnostic executable
 │   └── QueryRewindApps/         # Existing Rewind query executable
 ├── scripts/                     # Build/release/validation scripts

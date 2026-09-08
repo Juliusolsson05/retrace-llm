@@ -143,6 +143,105 @@ enum SourceDatabase {
         CLIError("unsupported_schema", "Required native schema is missing or incompatible (schema_migrations, segment, frame, video, node); no migrations were run.")
     }
 
+    struct FrameOCRRegion: Sendable {
+        let nodeOrder: Int
+        let text: String
+        let leftX: Double
+        let topY: Double
+        let width: Double
+        let height: Double
+        let windowIndex: Int?
+    }
+
+    struct FrameVideoInfo: Sendable {
+        let videoId: Int64
+        let videoFrameIndex: Int?
+        let chunkKey: String
+        let frameRate: Double?
+    }
+
+    struct FrameSegmentInfo: Sendable {
+        let segmentId: Int64
+        let appBundleId: String?
+        let windowName: String?
+        let browserUrl: String?
+    }
+
+    struct FrameEvidence: Sendable {
+        let frameId: Int64
+        let timestampMs: Int64
+        let textAvailable: Bool
+        let video: FrameVideoInfo?
+        let segment: FrameSegmentInfo?
+        var regions: [FrameOCRRegion] = []
+        var encryptedRegionCount = 0
+    }
+
+    /// Single-frame evidence: lineage plus OCR regions. Text slicing mirrors the app's
+    /// canonical read (Database/Queries/NodeQueries.swift getNodesWithText): the frame's
+    /// text blob is searchRanking_content c0||c1 reached via doc_segment, each node
+    /// slices SUBSTR(blob, textOffset + 1, textLength), and encrypted nodes yield the
+    /// same-length space placeholder instead of their ciphertext.
+    static func frameEvidence(_ connection: DatabaseConnection, frameId: Int64) throws -> FrameEvidence? {
+        try statement(connection, """
+            SELECT f.id, f.createdAt, f.videoFrameIndex,
+                   v.id, v.path, v.frameRate,
+                   s.id, NULLIF(s.bundleID, ''), s.windowName, s.browserUrl,
+                   ds.docid,
+                   n.nodeOrder, n.textOffset, n.textLength, n.leftX, n.topY, n.width, n.height, n.windowIndex,
+                   CASE WHEN n.encryptedText IS NOT NULL THEN 1 ELSE 0 END,
+                   CASE WHEN n.encryptedText IS NOT NULL THEN printf('%.*c', n.textLength, ' ')
+                        ELSE SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength) END
+            FROM frame f
+            LEFT JOIN video v ON v.id = f.videoId
+            LEFT JOIN segment s ON s.id = f.segmentId
+            LEFT JOIN doc_segment ds ON ds.frameId = f.id
+            LEFT JOIN node n ON n.frameId = f.id
+            LEFT JOIN searchRanking_content sc ON sc.id = ds.docid
+            WHERE f.id = ?
+            ORDER BY n.nodeOrder ASC
+            """) { stmt in
+            guard sqlite3_bind_int64(stmt, 1, frameId) == SQLITE_OK else {
+                throw CLIError("database_query_failed", "Could not bind frame evidence lookup.")
+            }
+            func text(_ column: Int32) -> String? {
+                guard let value = sqlite3_column_text(stmt, column) else { return nil }
+                return String(decoding: UnsafeBufferPointer(start: value, count: Int(sqlite3_column_bytes(stmt, column))), as: UTF8.self)
+            }
+            func integer(_ column: Int32) -> Int64? {
+                sqlite3_column_type(stmt, column) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, column)
+            }
+            var evidence: FrameEvidence?
+            var result = sqlite3_step(stmt)
+            while result == SQLITE_ROW {
+                guard let id = integer(0), let createdAt = integer(1) else {
+                    throw CLIError("database_query_failed", "Frame evidence contains invalid native numeric metadata.")
+                }
+                if evidence == nil {
+                    evidence = FrameEvidence(
+                        frameId: id, timestampMs: createdAt,
+                        textAvailable: sqlite3_column_type(stmt, 10) != SQLITE_NULL,
+                        video: integer(3).map { FrameVideoInfo(videoId: $0, videoFrameIndex: integer(2).map(Int.init), chunkKey: text(4) ?? "", frameRate: sqlite3_column_type(stmt, 5) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 5)) },
+                        segment: integer(6).map { FrameSegmentInfo(segmentId: $0, appBundleId: text(7), windowName: text(8), browserUrl: text(9)) }
+                    )
+                }
+                if integer(11) != nil {
+                    evidence?.regions.append(FrameOCRRegion(
+                        nodeOrder: Int(integer(11)!),
+                        text: text(20) ?? "",
+                        leftX: sqlite3_column_double(stmt, 14), topY: sqlite3_column_double(stmt, 15),
+                        width: sqlite3_column_double(stmt, 16), height: sqlite3_column_double(stmt, 17),
+                        windowIndex: integer(18).map(Int.init)
+                    ))
+                    if sqlite3_column_int(stmt, 19) != 0 { evidence?.encryptedRegionCount += 1 }
+                }
+                result = sqlite3_step(stmt)
+            }
+            guard result == SQLITE_DONE else { throw CLIError("database_query_failed", "Frame evidence SELECT did not complete.") }
+            return evidence
+        }
+    }
+
     static func aggregate(_ connection: DatabaseConnection) throws -> DatabaseSummary {
         // One statement gives internally consistent counts/coverage at SQLite's read snapshot.
         try statement(connection, """
