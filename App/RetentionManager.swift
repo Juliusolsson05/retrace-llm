@@ -193,7 +193,7 @@ public actor RetentionManager {
             // Step 1: Get video segments that will be affected (for cleanup)
             let videoSegmentsToDelete = try await getVideoSegmentsOlderThan(cutoffDate, excludingApps: excludedApps, excludingTagIds: excludedTagIds, excludeHidden: excludeHidden)
 
-            // Step 2: Delete frames from database (this cascades to FTS entries via triggers)
+            // Step 2: Delete frames and their OCR index entries transactionally.
             let deletedFrameCount = try await deleteFrames(olderThan: cutoffDate, excludingApps: excludedApps, excludingTagIds: excludedTagIds, excludeHidden: excludeHidden)
             Log.info("[RetentionManager] Deleted \(deletedFrameCount) frames from database", category: .app)
 
@@ -379,7 +379,7 @@ public actor RetentionManager {
     }
 
     /// Delete frames older than the cutoff date, excluding frames from protected apps/tags/hidden
-    private func deleteFrames(olderThan cutoffDate: Date, excludingApps: Set<String>, excludingTagIds: Set<Int64>, excludeHidden: Bool) async throws -> Int {
+    func deleteFrames(olderThan cutoffDate: Date, excludingApps: Set<String>, excludingTagIds: Set<Int64>, excludeHidden: Bool) async throws -> Int {
         guard let db = await database.getConnection() else {
             throw RetentionError.databaseNotConnected
         }
@@ -408,40 +408,48 @@ public actor RetentionManager {
 
         let whereClause = conditions.joined(separator: " AND ")
         let sql = """
-            DELETE FROM frame WHERE id IN (
-                SELECT f.id FROM frame f
-                JOIN segment s ON f.segmentId = s.id
-                WHERE \(whereClause)
-            );
+            SELECT f.id FROM frame f
+            JOIN segment s ON f.segmentId = s.id
+            WHERE \(whereClause);
         """
 
-        var statement: OpaquePointer?
-        defer { sqlite3_finalize(statement) }
+        var frameIDs: [Int64] = []
+        do {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
 
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            throw RetentionError.queryFailed(String(cString: sqlite3_errmsg(db)))
-        }
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw RetentionError.queryFailed(String(cString: sqlite3_errmsg(db)))
+            }
 
-        // Bind all values
-        var bindIndex: Int32 = 1
-        sqlite3_bind_int64(statement, bindIndex, cutoffMs)
-        bindIndex += 1
-
-        for bundleID in excludingApps {
-            sqlite3_bind_text(statement, bindIndex, bundleID, -1, SQLITE_TRANSIENT)
+            // Bind all values
+            var bindIndex: Int32 = 1
+            sqlite3_bind_int64(statement, bindIndex, cutoffMs)
             bindIndex += 1
+
+            for bundleID in excludingApps {
+                sqlite3_bind_text(statement, bindIndex, bundleID, -1, SQLITE_TRANSIENT)
+                bindIndex += 1
+            }
+
+            for tagId in excludingTagIds {
+                sqlite3_bind_int64(statement, bindIndex, tagId)
+                bindIndex += 1
+            }
+
+            var result = sqlite3_step(statement)
+            while result == SQLITE_ROW {
+                frameIDs.append(sqlite3_column_int64(statement, 0))
+                result = sqlite3_step(statement)
+            }
+            guard result == SQLITE_DONE else {
+                throw RetentionError.queryFailed(String(cString: sqlite3_errmsg(db)))
+            }
         }
 
-        for tagId in excludingTagIds {
-            sqlite3_bind_int64(statement, bindIndex, tagId)
-            bindIndex += 1
-        }
-
-        guard sqlite3_step(statement) == SQLITE_DONE else {
-            throw RetentionError.queryFailed(String(cString: sqlite3_errmsg(db)))
-        }
-
-        return Int(sqlite3_changes(db))
+        // Finalize selection before handing writes to the database actor. Raw frame deletion
+        // cannot cascade to doc_segment or FTS; the shared query helper preserves shared docs.
+        return try await database.deleteFrames(ids: frameIDs)
     }
 
     /// Delete app segments (sessions) older than the cutoff date, excluding protected apps/tags/hidden

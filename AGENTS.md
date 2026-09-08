@@ -170,6 +170,7 @@ retrace/
 │       ├── FeedbackRecentMetricSupportTests.swift # Feedback-export metric sanitization coverage
 │       ├── InPageURLCaptureRoutingTests.swift
 │       ├── MasterKeyManagerTests.swift
+│       ├── RetentionManagerTests.swift # Retention OCR cleanup, exclusions, and bounded transaction coverage
 │       ├── ServiceContainerRewindCutoffTests.swift # Rewind cutoff defaults and latest-frame probe coverage
 │       ├── TestLogger.swift
 │       ├── TimelineStillDiskWriterTests.swift

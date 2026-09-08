@@ -704,6 +704,22 @@ public actor DatabaseManager: DatabaseProtocol {
         return try FrameQueries.deleteOlderThan(db: db, date: date)
     }
 
+    /// Delete selected frames and their OCR index entries in bounded transactions.
+    /// Each batch commits independently; a failed batch rolls back its frames and OCR together.
+    public func deleteFrames(ids: [Int64]) async throws -> Int {
+        guard !ids.isEmpty else { return 0 }
+
+        let batchSize = 500
+        var deletedCount = 0
+        for start in stride(from: 0, to: ids.count, by: batchSize) {
+            let batch = Array(ids[start..<min(start + batchSize, ids.count)])
+            deletedCount += try withTracedDatabaseOperation("delete_frames_by_ids") { db in
+                try FrameQueries.deleteFrameIDs(db: db, frameIDs: batch)
+            }
+        }
+        return deletedCount
+    }
+
     /// Delete frames newer than the specified date (for quick delete feature)
     public func deleteFrames(newerThan date: Date) async throws -> Int {
         guard let db = db else {

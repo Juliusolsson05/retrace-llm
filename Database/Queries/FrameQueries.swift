@@ -1204,7 +1204,7 @@ public enum FrameQueries {
         return try deleteFrameIDs(db: db, frameIDs: frameIDs)
     }
 
-    private static func deleteFrameIDs(db: OpaquePointer, frameIDs: [Int64]) throws -> Int {
+    static func deleteFrameIDs(db: OpaquePointer, frameIDs: [Int64]) throws -> Int {
         guard !frameIDs.isEmpty else {
             return 0
         }
@@ -1214,10 +1214,13 @@ public enum FrameQueries {
             try beginTransaction(db: db)
         }
 
+        var deletedCount = 0
         do {
             for frameID in frameIDs {
                 try FTSQueries.deleteForFrame(db: db, frameId: frameID)
                 try deleteFrameRow(db: db, frameID: frameID)
+                // Count frame rows only, including duplicate or already-deleted IDs correctly.
+                deletedCount += Int(sqlite3_changes(db))
             }
 
             if managesOwnTransaction {
@@ -1230,7 +1233,7 @@ public enum FrameQueries {
             throw error
         }
 
-        return frameIDs.count
+        return deletedCount
     }
 
     private static func deleteFrameRow(db: OpaquePointer, frameID: Int64) throws {
