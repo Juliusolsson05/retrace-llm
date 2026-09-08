@@ -231,6 +231,19 @@ public actor WALManager {
         }
 
         do {
+            // Durable updates are persisted independently of the writer's session copy.
+            // Do not let the next append erase the recovery frontier they established.
+            // A best-effort merge keeps the save unconditional: a corrupt sidecar is
+            // overwritten with the in-memory copy rather than staying stale, which
+            // would also break every later updateDurableVideoState call.
+            if let persisted = try? loadMetadata(from: session.sessionDir) {
+                session.metadata.durableReadableFrameCount = max(
+                    session.metadata.durableReadableFrameCount, persisted.durableReadableFrameCount
+                )
+                session.metadata.durableVideoFileSizeBytes = max(
+                    session.metadata.durableVideoFileSizeBytes, persisted.durableVideoFileSizeBytes
+                )
+            }
             try saveMetadata(session.metadata, to: session.sessionDir)
         } catch {
             Log.warning(

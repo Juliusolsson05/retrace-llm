@@ -950,6 +950,28 @@ final class StorageManagerTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testWALAppendPreservesPersistedDurableFrontier() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let walManager = WALManager(walRoot: root.appendingPathComponent("wal", isDirectory: true))
+        try await walManager.initialize()
+        var session = try await walManager.createSession(videoID: VideoSegmentID(value: 313))
+        let frame = makeCapturedFrame()
+        try await walManager.appendFrame(frame, to: &session)
+        try await walManager.updateDurableVideoState(
+            videoID: session.videoID, readableFrameCount: 1, durableVideoFileSizeBytes: 8192
+        )
+        // The writer still holds the original session value after the disk-only update.
+        try await walManager.appendFrame(frame, to: &session)
+        let sessions = try await walManager.listActiveSessions()
+        let reloaded = try XCTUnwrap(sessions.first { $0.videoID == session.videoID })
+        XCTAssertEqual(reloaded.metadata.frameCount, 2)
+        XCTAssertEqual(reloaded.metadata.durableReadableFrameCount, 1)
+        XCTAssertEqual(reloaded.metadata.durableVideoFileSizeBytes, 8192)
+        let restored = try await walManager.readFrame(videoID: session.videoID, frameIndex: 1)
+        XCTAssertEqual(restored.imageData, frame.imageData)
+    }
+
     func testReadFrameByFrameIDUsesRegisteredMappingInsteadOfFallbackIndex() async throws {
         let root = makeTempRoot()
         let walRoot = root.appendingPathComponent("wal", isDirectory: true)
