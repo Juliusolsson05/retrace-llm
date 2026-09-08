@@ -59,12 +59,14 @@ retrace/
 │   └── decomposition/           # Staged decomposition docs for large features
 ├── Package.swift                # Swift Package Manager configuration
 ├── Sources/
-│   ├── RetraceCLI/              # Read-only metadata executable product `retrace-cli`
+│   ├── RetraceCLI/              # Read-only evidence and local sync planning executable `retrace-cli`
 │   │   ├── RetraceCLI.swift     # Noninteractive entry point
-│   │   ├── CLICommand.swift     # JSON contract, usage/exit codes, metadata-only command routing
+│   │   ├── CLICommand.swift     # JSON/JSONL contracts, usage/exit codes, evidence and dry-run routing
 │   │   ├── SourceDatabase.swift # Native schema/aggregate SELECTs, strict read-only source VFS
 │   │   ├── ChunkInventory.swift # Bounded descriptor-relative metadata inventory
 │   │   ├── CLIStateMetrics.swift # Independent CLI-owned daily_metrics SQLite store
+│   │   ├── B2Client.swift       # Disabled-by-default B2 Native API shell with injectable transport
+│   │   ├── SyncPlanner.swift    # Read-only chunk hashing and revision planning; uploads disabled
 │   │   └── Tests/RetraceCLITests.swift # Temporary SQLite/FileManager contract fixtures
 │   ├── TestMostRecentFrame/     # Existing diagnostic executable
 │   └── QueryRewindApps/         # Existing Rewind query executable
@@ -125,7 +127,10 @@ retrace/
 │   ├── FileManager/             # File system utilities
 │   ├── VideoEncoder/            # HEVC video encoding
 │   ├── WAL/                     # Write-Ahead Log (WALManager, RecoveryManager)
+│   ├── CloudSync/
+│   │   └── SyncManifest.swift   # Transactional manifest in independent CLI state only
 │   └── Tests/
+│       └── SyncManifestTests.swift # Temporary SQLite revision/reopen and state safety fixtures
 │
 ├── Capture/                     # CGWindowListCapture integration
 │   ├── AGENTS.md
@@ -216,13 +221,13 @@ retrace/
 | Module         | Directory     | Agent File             | Responsibility                                                     |
 | -------------- | ------------- | ---------------------- | ------------------------------------------------------------------ |
 | **DATABASE**   | `Database/`   | `Database/AGENTS.md`   | SQLite schema, FTS5, CRUD operations, migrations                   |
-| **STORAGE**    | `Storage/`    | `Storage/AGENTS.md`    | File I/O, HEVC video encoding (working, not optimized), encryption |
+| **STORAGE**    | `Storage/`    | `Storage/AGENTS.md`    | File I/O, HEVC video encoding, encryption, independent CLI sync manifest |
 | **CAPTURE**    | `Capture/`    | `Capture/AGENTS.md`    | CGWindowListCapture API, frame deduplication, metadata extraction  |
 | **PROCESSING** | `Processing/` | `Processing/AGENTS.md` | Vision OCR, Accessibility API (no audio transcription yet)         |
 | **SEARCH**     | `Search/`     | `Search/AGENTS.md`     | Query parsing, FTS5 queries, result ranking (no vector search yet) |
 | **MIGRATION**  | `Migration/`  | `Migration/AGENTS.md`  | Import from Rewind AI (Rewind only, others planned)                |
 | **APP**        | `App/`        | —                      | Coordinator, DI container, data adapter, lifecycle management      |
-| **CLI**        | `Sources/RetraceCLI/` | root guide       | Read-only native aggregate status, bounded chunk inventory, independent CLI metrics |
+| **CLI**        | `Sources/RetraceCLI/` | root guide       | Read-only evidence, bounded inventory, sync dry-run planning and independent CLI metrics |
 | **UI**         | `UI/`         | `UI/AGENTS.md`         | SwiftUI interface (timeline, dashboard, settings, search)          |
 
 **Rule**: Each agent should **ONLY** modify files in their assigned module directory. Cross-module changes require explicit coordination.

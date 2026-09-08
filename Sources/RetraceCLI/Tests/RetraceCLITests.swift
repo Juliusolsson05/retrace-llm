@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 import SQLCipher
 import Shared
+import Storage
 @testable import Database
 @testable import RetraceCLI
 
@@ -437,6 +438,221 @@ final class RetraceCLITests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: state.path))
     }
 
+    func testStreamingHasherKnownVectorsAcrossOneMiBBoundary() async throws {
+        let vectors: [(Data, String, String)] = [
+            (Data(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+            (Data("abc".utf8), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "a9993e364706816aba3e25717850c26c9cd0d89d"),
+            (Data(repeating: 97, count: 1_048_579), "f5e25b6b994188fdb721357d459785dc479934edfd40f95658a45ab2ce2d8027", "f115526df8beeaf0ad6a3c0223b1a546e10425e1")
+        ]
+        let file = sandbox.appendingPathComponent("hash-vector")
+        for (bytes, sha256, sha1) in vectors {
+            try bytes.write(to: file)
+            let digest = try await SyncFileHasher.hash(file: file)
+            XCTAssertEqual(digest.sha256, sha256)
+            XCTAssertEqual(digest.sha1, sha1)
+            XCTAssertEqual(digest.sizeBytes, Int64(bytes.count))
+        }
+    }
+
+    func testSyncDryRunPlansNewUnchangedAndRewrittenWithoutManifestWrites() async throws {
+        let day = root.appendingPathComponent("chunks/202609/08")
+        try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        let file = day.appendingPathComponent("1")
+        try Data("abc".utf8).write(to: file)
+        let firstResult = await run("sync", extra: ["--dry-run"])
+        XCTAssertEqual(firstResult.exitCode, 0, firstResult.stderr)
+        let first = try json(firstResult)
+        let uploads = try XCTUnwrap(first["wouldUpload"] as? [[String: Any]])
+        XCTAssertEqual(uploads.count, 1)
+        XCTAssertEqual(uploads.first?["key"] as? String, "chunks/202609/08/1")
+        XCTAssertEqual(uploads.first?["revision"] as? Int, 1)
+        XCTAssertEqual(first["bytesTotal"] as? Int, 3)
+        XCTAssertEqual(first["objectsTotal"] as? Int, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.appendingPathComponent(SyncManifest.filename).path))
+
+        let digest = try await SyncFileHasher.hash(file: file)
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: root)
+        _ = try await manifest.record(key: "chunks/202609/08/1", sha256: digest.sha256, sizeBytes: 3, mtimeNs: digest.mtimeNs)
+        try await manifest.markUploaded(key: "chunks/202609/08/1", revision: 1, uploadedAt: 100, contentTag: "fixture")
+        try await manifest.close()
+        let manifestURL = state.appendingPathComponent(SyncManifest.filename)
+        let before = try Data(contentsOf: manifestURL)
+        let namesBefore = try FileManager.default.contentsOfDirectory(atPath: state.path).sorted()
+        let unchanged = try json(await run("sync", extra: ["--dry-run"]))
+        XCTAssertEqual(unchanged["unchangedCount"] as? Int, 1)
+        XCTAssertEqual((unchanged["wouldUpload"] as? [Any])?.count, 0)
+        XCTAssertEqual((unchanged["wouldReupload"] as? [Any])?.count, 0)
+        // Same length and restored mtime must still be detected by content, never a stat shortcut.
+        let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
+        try Data("abd".utf8).write(to: file)
+        try FileManager.default.setAttributes([.modificationDate: try XCTUnwrap(attrs[.modificationDate])], ofItemAtPath: file.path)
+        let rewritten = try json(await run("sync", extra: ["--dry-run"]))
+        let changes = try XCTUnwrap(rewritten["wouldReupload"] as? [[String: Any]])
+        XCTAssertEqual(changes.count, 1)
+        XCTAssertEqual(changes.first?["revision"] as? Int, 2)
+        XCTAssertNotEqual(changes.first?["sha256"] as? String, digest.sha256)
+        XCTAssertEqual(try Data(contentsOf: manifestURL), before)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: state.path).sorted(), namesBefore)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: database.path))
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(state.appendingPathComponent("metrics.db").path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT metadata FROM daily_metrics ORDER BY id DESC LIMIT 1", -1, &statement, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        let metric = String(cString: sqlite3_column_text(statement, 0))
+        XCTAssertTrue(metric.contains("sync"))
+        XCTAssertTrue(metric.contains("succeeded"))
+        XCTAssertFalse(metric.contains(digest.sha256))
+        XCTAssertFalse(metric.contains("chunks/"))
+    }
+
+    func testSyncExcludesZeroBytesNoncanonicalNamesAndSymlinks() async throws {
+        let day = root.appendingPathComponent("chunks/202402/29")
+        try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        for (name, bytes) in [("1", 3), ("2", 0), ("01", 4), ("3.tmp", 5)] {
+            try Data(repeating: 97, count: bytes).write(to: day.appendingPathComponent(name))
+        }
+        let invalid = root.appendingPathComponent("chunks/202402/30")
+        try FileManager.default.createDirectory(at: invalid, withIntermediateDirectories: true)
+        try Data("invalid-day".utf8).write(to: invalid.appendingPathComponent("4"))
+        try FileManager.default.createSymbolicLink(at: day.appendingPathComponent("5"), withDestinationURL: day.appendingPathComponent("1"))
+        let result = await run("sync", extra: ["--dry-run"])
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        let report = try json(result)
+        XCTAssertEqual(report["objectsTotal"] as? Int, 1)
+        XCTAssertEqual(report["bytesTotal"] as? Int, 3)
+        XCTAssertEqual(report["incompleteFileCount"] as? Int, 1)
+        XCTAssertEqual(report["noncanonicalFileCount"] as? Int, 3)
+        XCTAssertEqual(report["noncanonicalDirectoryCount"] as? Int, 1)
+        XCTAssertEqual(report["symlinkCount"] as? Int, 1)
+    }
+
+    func testSyncRequiresDryRunAndStrictOptions() async throws {
+        let disabled = await run("sync")
+        XCTAssertEqual(disabled.exitCode, 6)
+        try assertError(disabled, "upload_disabled")
+        XCTAssertTrue(disabled.stderr.contains("privacy-deletion"))
+        XCTAssertTrue(disabled.stderr.contains("snapshot"))
+        XCTAssertTrue(disabled.stderr.contains("encryption"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+        for options in [["--dry-run", "--dry-run"], ["--dry-run", "true"], ["--unknown"]] {
+            try assertError(await run("sync", extra: options), "usage")
+        }
+        let help = try json(await CLICommand.run(arguments: ["help"]))
+        XCTAssertTrue((help["help"] as? [String])?.contains(where: { $0.contains("sync --dry-run") }) == true)
+    }
+
+    func testSyncPlanningBudgetAndHardlinksArePartialAndPendingObjectsRemainPlanned() async throws {
+        let day = root.appendingPathComponent("chunks/202609/08")
+        try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        let file = day.appendingPathComponent("1")
+        try Data("abc".utf8).write(to: file)
+        let bounded = try await SyncPlanner.plan(root: root, state: state, maxEntries: 1)
+        XCTAssertEqual(bounded.exitCode, 4)
+        XCTAssertEqual(bounded.errors["entry_limit"], 1)
+        XCTAssertTrue(bounded.wouldUpload.isEmpty)
+        let digest = try await SyncFileHasher.hash(file: file)
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: root)
+        _ = try await manifest.record(key: "chunks/202609/08/1", sha256: digest.sha256, sizeBytes: 3, mtimeNs: digest.mtimeNs)
+        try await manifest.close()
+        let pending = try json(await run("sync", extra: ["--dry-run"]))
+        XCTAssertEqual((pending["wouldUpload"] as? [[String: Any]])?.first?["revision"] as? Int, 1)
+        XCTAssertEqual(pending["unchangedCount"] as? Int, 0)
+        try FileManager.default.linkItem(at: file, to: sandbox.appendingPathComponent("outside-link"))
+        let unsafe = await run("sync", extra: ["--dry-run"])
+        XCTAssertEqual(unsafe.exitCode, 4)
+        let report = try json(unsafe)
+        XCTAssertEqual((report["errors"] as? [String: Int])?["unsafe_chunk"], 1)
+        XCTAssertEqual(report["objectsTotal"] as? Int, 0)
+    }
+
+    func testB2AuthorizeAndUploadUseNativeHeadersAndFileTransport() async throws {
+        let transport = B2StubTransport(responses: [
+            (200, Self.authorizationJSON),
+            (200, #"{"bucketId":"bucket","uploadUrl":"https://upload.example.test/b2api/v4/b2_upload_file","authorizationToken":"upload-token"}"#),
+            (200, Self.fileJSON)
+        ])
+        let client = B2Client(enabled: true, transport: transport, credentials: { B2Credentials(keyID: "fixture-id", applicationKey: "fixture-key") })
+        let authorization = try await client.authorize()
+        XCTAssertEqual(authorization.accountId, "account")
+        let upload = try await client.getUploadURL(authorization: authorization, bucketID: "bucket")
+        let file = sandbox.appendingPathComponent("upload-fixture")
+        try Data("abc".utf8).write(to: file)
+        let result = try await client.uploadFile(upload: upload, fileName: "chunks/a b/å%.mp4", file: file,
+                                               sizeBytes: 3, sha1: "a9993e364706816aba3e25717850c26c9cd0d89d")
+        XCTAssertEqual(result.fileId, "file-id")
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count, 3)
+        XCTAssertEqual(requests[0].request.url?.absoluteString, "https://api.backblazeb2.com/b2api/v4/b2_authorize_account")
+        XCTAssertEqual(requests[0].request.httpMethod, "GET")
+        XCTAssertEqual(requests[0].request.value(forHTTPHeaderField: "Authorization"), "Basic " + Data("fixture-id:fixture-key".utf8).base64EncodedString())
+        XCTAssertEqual(requests[1].request.url?.path, "/b2api/v4/b2_get_upload_url")
+        XCTAssertEqual(requests[1].request.value(forHTTPHeaderField: "Authorization"), "account-token")
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(requests[1].request.httpBody)) as? [String: String])
+        XCTAssertEqual(body["bucketId"], "bucket")
+        let request = requests[2].request
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Bz-File-Name"), "chunks/a%20b/%C3%A5%25.mp4")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Bz-Content-Sha1"), "a9993e364706816aba3e25717850c26c9cd0d89d")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Length"), "3")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "upload-token")
+        XCTAssertNil(request.value(forHTTPHeaderField: "Transfer-Encoding"))
+        XCTAssertNil(request.httpBody)
+        XCTAssertEqual(requests[2].file, file)
+    }
+
+    func testB2DisabledMissingCredentialsAndErrorMapping() async throws {
+        let transport = B2StubTransport(responses: [])
+        let disabled = B2Client(transport: transport, credentials: { XCTFail("Credentials must be lazy and behind the gate"); return nil })
+        do { _ = try await disabled.authorize(); XCTFail("Disabled client sent a request") }
+        catch { XCTAssertEqual(error as? B2ClientError, .disabled) }
+        let missing = B2Client(enabled: true, transport: transport, credentials: { nil })
+        do { _ = try await missing.authorize(); XCTFail("Missing credentials accepted") }
+        catch { XCTAssertEqual(error as? B2ClientError, .missingCredentials) }
+        let requests = await transport.requests
+        XCTAssertTrue(requests.isEmpty)
+        let cases: [(Int, String, B2ClientError)] = [(401, "expired_token", .expiredToken), (401, "bad_auth_token", .badAuthToken),
+                                                  (400, "bad_request", .badRequest), (503, "service_unavailable", .retryable)]
+        for (status, code, expected) in cases {
+            let stub = B2StubTransport(responses: [(status, "{\"status\":\(status),\"code\":\"\(code)\",\"message\":\"must-not-echo-provider-message\"}")])
+            let client = B2Client(enabled: true, transport: stub, credentials: { B2Credentials(keyID: "id", applicationKey: "key") })
+            do { _ = try await client.authorize(); XCTFail("Expected typed API error") }
+            catch {
+                XCTAssertEqual(error as? B2ClientError, expected)
+                XCTAssertFalse(String(describing: error).contains("must-not-echo"))
+            }
+        }
+    }
+
+    func testB2ListVersionsPaginatesAndDeletionUsesBothIdentifiers() async throws {
+        let transport = B2StubTransport(responses: [
+            (200, Self.authorizationJSON),
+            (200, "{\"files\":[\(Self.fileJSON)],\"nextFileName\":\"next name\",\"nextFileId\":\"next-id\"}"),
+            (200, #"{"files":[],"nextFileName":null,"nextFileId":null}"#),
+            (200, #"{"fileId":"file-id","fileName":"chunks/one"}"#)
+        ])
+        let client = B2Client(enabled: true, transport: transport, credentials: { B2Credentials(keyID: "id", applicationKey: "key") })
+        let authorization = try await client.authorize()
+        let versions = try await client.listFileVersions(authorization: authorization, bucketID: "bucket")
+        XCTAssertEqual(versions.map(\.fileId), ["file-id"])
+        let deleted = try await client.deleteFileVersion(authorization: authorization, fileID: "file-id", fileName: "chunks/one")
+        XCTAssertEqual(deleted.fileId, "file-id")
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count, 4)
+        let secondPage = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(requests[2].request.httpBody)) as? [String: Any])
+        XCTAssertEqual(secondPage["startFileName"] as? String, "next name")
+        XCTAssertEqual(secondPage["startFileId"] as? String, "next-id")
+        XCTAssertEqual(secondPage["bucketId"] as? String, "bucket")
+        XCTAssertEqual(requests[3].request.url?.path, "/b2api/v4/b2_delete_file_version")
+        let deletion = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(requests[3].request.httpBody)) as? [String: String])
+        XCTAssertEqual(deletion, ["fileId": "file-id", "fileName": "chunks/one"])
+    }
+
+    private static let authorizationJSON = #"{"accountId":"account","authorizationToken":"account-token","apiInfo":{"storageApi":{"apiUrl":"https://api.example.test","downloadUrl":"https://download.example.test","recommendedPartSize":100000000,"absoluteMinimumPartSize":5000000,"capabilities":["listFiles","writeFiles"]}},"applicationKeyExpirationTimestamp":null}"#
+    private static let fileJSON = #"{"fileId":"file-id","fileName":"chunks/one","action":"upload","contentLength":3,"contentSha1":"a9993e364706816aba3e25717850c26c9cd0d89d","uploadTimestamp":1234,"fileInfo":{}}"#
+
     func testMissingRootMissingDatabaseAndZeroByteDatabaseDoNotCreateSource() async throws {
         try assertError(await run(), "storage_root_missing")
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
@@ -681,5 +897,22 @@ final class RetraceCLITests: XCTestCase {
         XCTAssertEqual(String(cString: sqlite3_column_text(statement, 0)), "cli_command")
         XCTAssertEqual(sqlite3_column_type(statement, 1), SQLITE_NULL)
         XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+    }
+}
+
+private actor B2StubTransport: B2Transport {
+    struct Recorded: Sendable {
+        let request: URLRequest
+        let file: URL?
+    }
+    var requests: [Recorded] = []
+    private var responses: [(Int, String)]
+    init(responses: [(Int, String)]) { self.responses = responses }
+    func send(_ request: URLRequest, file: URL?) async throws -> (Data, HTTPURLResponse) {
+        requests.append(Recorded(request: request, file: file))
+        guard !responses.isEmpty else { throw URLError(.badServerResponse) }
+        let (status, body) = responses.removeFirst()
+        let response = try XCTUnwrap(HTTPURLResponse(url: XCTUnwrap(request.url), statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil))
+        return (Data(body.utf8), response)
     }
 }

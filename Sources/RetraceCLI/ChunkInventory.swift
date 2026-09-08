@@ -33,7 +33,8 @@ struct ChunkInventory: Encodable, Sendable {
         await Task.detached { scanSynchronously(root: root, maxEntries: maxEntries, maxSeconds: maxSeconds) }.value
     }
 
-    static func scanSynchronously(root: URL, maxEntries: Int = 100_000, maxSeconds: Double = 10) -> ChunkInventory {
+    static func scanSynchronously(root: URL, maxEntries: Int = 100_000, maxSeconds: Double = 10,
+                                  onCanonicalFile: ((Int32, String, String, stat) throws -> Void)? = nil) -> ChunkInventory {
         let started = ProcessInfo.processInfo.systemUptime
         var result = ChunkInventory()
         result.entryLimit = maxEntries
@@ -48,7 +49,8 @@ struct ChunkInventory: Encodable, Sendable {
             return !stopped
         }
         // Descriptor-relative traversal never follows a directory or file symlink, even if
-        // a directory entry is replaced between readdir and openat. No recording is opened.
+        // a directory entry is replaced between readdir and openat. Baseline only reads
+        // metadata; sync's optional visitor opens candidates relative to this same FD.
         func walk(_ fd: Int32, components: [String]) {
             guard let directory = fdopendir(fd) else { close(fd); failure("directory_unreadable"); return }
             defer { closedir(directory) }
@@ -84,6 +86,12 @@ struct ChunkInventory: Encodable, Sendable {
                     if canonical && bytes == 0 {
                         result.incompleteFileCount += 1
                     } else if canonical {
+                        do {
+                            try onCanonicalFile?(fd, name, (["chunks"] + components + [name]).joined(separator: "/"), attributes)
+                        } catch {
+                            failure((error as? CLIError)?.code ?? "chunk_unreadable")
+                            continue
+                        }
                         let month = String(components[0].prefix(4)) + "-" + String(components[0].suffix(2))
                         var total = byMonth[month] ?? Month(month: month)
                         let sum = total.bytes.addingReportingOverflow(bytes)

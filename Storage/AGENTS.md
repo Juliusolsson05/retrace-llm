@@ -11,9 +11,14 @@ Storage/
 ├── GeneratorCachePolicy.swift   # Shared idle/LRU eviction policy for AVAsset generator caches
 ├── StorageManager.swift         # Main StorageProtocol implementation
 ├── SegmentWriterImpl.swift      # SegmentWriter implementation
-├── Encryption/
-│   ├── EncryptionManager.swift  # AES-256-GCM encryption
-│   └── KeychainHelper.swift     # Keychain key storage
+├── IncrementalSegmentWriter.swift # WAL-backed incremental writer
+├── ImageExtractor.swift         # Video frame extraction and generator cache
+├── StorageModuleError.swift     # Module-local errors
+├── CloudSync/
+│   └── SyncManifest.swift       # CLI-state-only SQLite manifest; no app database writes
+├── WAL/
+│   ├── WALManager.swift
+│   └── RecoveryManager.swift
 ├── FileManager/
 │   ├── DirectoryManager.swift   # Directory structure management
 │   └── StorageHealthMonitor.swift # Disk space + I/O + volume health monitoring
@@ -22,7 +27,9 @@ Storage/
 │   └── FrameConverter.swift     # Pixel format conversion
 └── Tests/
     ├── StorageManagerTests.swift
-    ├── EncryptionTests.swift
+    ├── SyncManifestTests.swift  # CRUD/revisions/reopen and state-root safety
+    ├── DirectoryManagerTests.swift
+    ├── TestLogger.swift
     └── HEVCEncoderTests.swift
 ```
 
@@ -47,19 +54,16 @@ Location: `AppPaths.storageRoot` (default: `~/Library/Application Support/Retrac
 {storageRoot}/
 ├── config.json                    # App configuration
 ├── retrace.db                     # SQLite database (owned by DATABASE)
-├── segments/
-│   ├── 2024/
-│   │   ├── 01/
-│   │   │   ├── 15/
-│   │   │   │   ├── segment_abc123.hevc.enc  # Encrypted video
-│   │   │   │   └── segment_def456.hevc.enc
-│   │   │   └── 16/
-│   │   │       └── ...
-│   │   └── 02/
-│   │       └── ...
-│   └── ...
+├── chunks/
+│   └── 202609/                    # Calendar directory label YYYYMM
+│       └── 08/                    # Day DD
+│           ├── 1                  # Positive decimal video ID; MP4 without extension
+│           └── 2
 └── temp/                          # Temporary files during encoding
 ```
+
+The sync manifest is outside this tree, at `{cliStateRoot}/sync-manifest.db`.
+Its SQLite journal/sidecars are CLI state too; they must never alias source data.
 
 ## Key Implementation Details
 
@@ -286,9 +290,11 @@ func readFrame(segmentID: SegmentID, frameIndex: Int) async throws -> Data {
 ## File Naming Convention
 
 ```
-segment_{uuid}.hevc.enc    # Encrypted HEVC video
-segment_{uuid}.hevc        # Unencrypted (if encryption disabled)
+chunks/YYYYMM/DD/<positive-decimal-videoID>  # MP4 container, no extension
 ```
+
+Rewrite artifacts and zero-byte files are not sync candidates. Directory labels
+alone do not prove capture timestamps or that a chunk is finalized.
 
 ## Error Handling
 
@@ -311,6 +317,13 @@ throw StorageError.insufficientDiskSpace
 
 ## Dependencies
 
+The Phase 1 B1 foundation explicitly coordinates `Storage/CloudSync` with the CLI.
+The CLI is the manifest's only consumer; it imports Storage for this local state API.
+The manifest uses the existing SQLCipher package without an encryption key and lives
+only in the independent CLI state root, never in app storage. Dry runs open it
+read-only and do not create it. B2 networking and upload policy remain CLI concerns;
+privacy deletion, consistent snapshots, and cloud encryption are pending gates.
+
 - **Input from**: CAPTURE module (CapturedFrame to encode and store)
 - **Output to**: UI (frame data for playback), DATABASE (VideoSegment metadata via App layer)
 - **Uses types**: `CapturedFrame`, `VideoSegment`, `SegmentID`, `StorageConfig`, `VideoEncoderConfig`, `EncryptionConfig`
@@ -319,7 +332,7 @@ throw StorageError.insufficientDiskSpace
 
 - Modify any files outside `Storage/`
 - Import from other module directories (only `Shared/`)
-- Store metadata in the database (that's DATABASE's job)
+- Store app metadata in the source database (that's DATABASE's job); CloudSync stores only independent CLI manifest state
 - Handle OCR or text extraction (that's PROCESSING's job)
 - Make decisions about what to capture (that's CAPTURE's job)
 

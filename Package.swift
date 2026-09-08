@@ -86,7 +86,7 @@ let package = Package(
         // MARK: - Storage module
         .target(
             name: "Storage",
-            dependencies: ["Shared"],
+            dependencies: ["Shared", .product(name: "SQLCipher", package: "swift-sqlcipher")],
             path: "Storage",
             exclude: [
                 "Tests",
@@ -97,7 +97,7 @@ let package = Package(
         ),
         .testTarget(
             name: "StorageTests",
-            dependencies: ["Storage", "Shared"],
+            dependencies: ["Storage", "Shared", .product(name: "SQLCipher", package: "swift-sqlcipher")],
             path: "Storage/Tests"
             // ⚠️ RELEASE 2 ONLY - Whisper linker settings removed for Release 1
         ),
@@ -267,13 +267,13 @@ let package = Package(
         // MARK: - Read-only metadata CLI (no application bootstrap)
         .executableTarget(
             name: "RetraceCLI",
-            dependencies: ["Shared", "Database", .product(name: "SQLCipher", package: "swift-sqlcipher")],
+            dependencies: ["Shared", "Database", "Storage", .product(name: "SQLCipher", package: "swift-sqlcipher")],
             path: "Sources/RetraceCLI",
             exclude: ["Tests"]
         ),
         .testTarget(
             name: "RetraceCLITests",
-            dependencies: ["RetraceCLI", "Database", "Shared", .product(name: "SQLCipher", package: "swift-sqlcipher")],
+            dependencies: ["RetraceCLI", "Database", "Shared", "Storage", .product(name: "SQLCipher", package: "swift-sqlcipher")],
             path: "Sources/RetraceCLI/Tests"
         ),
 

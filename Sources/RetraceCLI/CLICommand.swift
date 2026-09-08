@@ -1,6 +1,7 @@
 import Foundation
 import Database
 import Shared
+import Storage
 
 struct CLIResult: Sendable {
     let stdout: Data
@@ -53,17 +54,21 @@ enum CLICommand {
         "swift run retrace-cli help",
         "swift run retrace-cli status [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli baseline [--storage-root PATH] [--state-root PATH]",
+        "swift run retrace-cli sync --dry-run [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli export --day YYYY-MM-DD [--storage-root PATH] [--state-root PATH] [--limit N]",
         "Build: swift build --product retrace-cli -j 4. Executable: .build/debug/retrace-cli. The installed command alias retrace is a later packaging step; the existing app product Retrace is separate.",
-        "stdout: one JSON object for help/status/baseline, schemaVersion=1; diagnostics: stderr. Export streams JSONL frames to stdout and one summary JSON object to stderr, including on failure. No prompts or application startup.",
-        "Exit codes: 0 complete, 2 invalid arguments/unsafe state path, 3 unavailable or unsupported source, 4 partial inventory, 5 metrics/output failure.",
+        "stdout: one JSON object for help/status/baseline/sync, schemaVersion=1; diagnostics: stderr. Export streams JSONL frames to stdout and one summary JSON object to stderr, including on failure. No prompts or application startup.",
+        "Exit codes: 0 complete, 2 invalid arguments/unsafe state path, 3 unavailable or unsupported source/manifest, 4 partial inventory/plan, 5 metrics/output failure, 6 upload_disabled.",
+        "Sync is local planning only: without --dry-run it exits 6 (upload_disabled). Privacy-deletion, consistent snapshot and encryption contracts remain pending: docs/decomposition/optimization-and-cloud-sync.md, Plan gates before implementation continues.",
+        "Sync hashes canonical nonempty chunks with SHA-256 and B2 SHA-1 in 1 MiB reads. It reads sync-manifest.db in CLI state without creating or writing it. Only independent command metrics are written. No source database, credentials, Keychain or network are accessed.",
+        "Sync stdout is one schemaVersion=1 JSON object: wouldUpload (new/pending), wouldReupload (changed SHA-256, revision+1), unchangedCount (already uploaded), bytesTotal/objectsTotal (all successfully hashed candidates), noncanonical/incomplete/symlink counts, errors and elapsedMs. Object keys are relative canonical chunk paths; no file contents are emitted. The scan is bounded to 100000 entries and 10 seconds, including checks between 1 MiB reads. Filesystem calls can exceed that bound. Plans are observational, not a backup recovery point or proof of finalized media.",
         "Storage defaults to Shared.AppPaths configured root; only an existing retrace.db is opened read-only. Paths may be relative or use ~; empty, memory and URI paths are rejected.",
         "Status counts native frame/video/node rows and frame timestamp coverage in Unix milliseconds. These are aggregate physical rows, including hidden/redacted rows, not a visibility-aware export API.",
         "Export requires a real date in strict YYYY-MM-DD format. It reads the local-calendar day, including its start and excluding next midnight, hidden segments, unsegmented frames, and deletion rewrites. Redacted frames remain visible. Rows are ordered by timestamp then frame ID; no OCR text or media paths are exported.",
         "Export frame keys: schemaVersion=1, frameId, timestampMs, videoId, videoFrameIndex, segmentId, appBundleId, appName, windowName, browserUrl. IDs/timestamps/indexes are integers; missing video references and metadata are explicit null. appName is the bundle-ID suffix used by DataAdapter, not an installed-app display-name lookup.",
         "Export defaults to --limit 5000 (allowed 1...50000). Summary frameCount, videoCount and segmentCount describe emitted frames and their distinct non-null video/segment IDs; limitApplied is the numeric limit. One visible lookahead row determines truncated. Truncation and empty days exit 0. On failure, already emitted lines remain valid but the export is incomplete; check exitCode/status. Counts and memory are bounded; SQLite may scan additional hidden/deleted rows.",
         "Baseline also inventories chunks/YYYYMM/DD/positive-decimal-videoID (no extension). Nonempty regular files are canonical candidates; zero-byte candidates are incomplete. Other files, directories, symlinks and errors are reported separately, without individual names.",
-        "File bytes are logical sizes, not allocated disk space. Month is the validated calendar directory label, not a timestamp or timezone inference. Files may be orphaned or unfinished; no decoding, hashing or DB-to-file reconciliation occurs. File counts do not equal frame counts; many frames share a video.",
+        "Baseline file bytes are logical sizes, not allocated disk space. Month is the validated calendar directory label, not a timestamp or timezone inference. Files may be orphaned or unfinished; baseline performs no decoding, hashing or DB-to-file reconciliation. File counts do not equal frame counts; many frames share a video.",
         "Inventory is bounded to 100000 entries and 10 seconds between metadata operations. A filesystem call itself may take longer. A limit or I/O error returns partial counts and exit 4. Missing chunks is empty only when the database has no video rows.",
         "Live results are observational, not an atomic database/filesystem snapshot. Elapsed time measures this command only, not OCR, compression or a performance improvement.",
         "The source VFS forbids creation/deletion and uses readonly_shm. WAL databases need existing readable WAL/SHM sidecars; otherwise access fails without repairing or creating them. No immutable mode is used, so live WAL data is not silently ignored.",
@@ -75,6 +80,7 @@ enum CLICommand {
         // This executable never bootstraps an application. Blocking SQLite/POSIX work stays
         // on a worker even when the command runner is called from another async context.
         await Task.detached {
+            if arguments.first == "sync" { return await executeSync(arguments: Array(arguments.dropFirst())) }
             if arguments.first == "export" { return executeExport(arguments: Array(arguments.dropFirst()), writeFrame: writeFrame) }
             return execute(arguments: arguments)
         }.value
@@ -86,7 +92,7 @@ enum CLICommand {
         var metrics: CLIStateMetrics?
         do {
             guard let command = arguments.first, ["help", "status", "baseline"].contains(command) else {
-                throw CLIError("usage", "Use swift run retrace-cli help, status, baseline, or export.", exitCode: 2)
+                throw CLIError("usage", "Use swift run retrace-cli help, status, baseline, export, or sync --dry-run.", exitCode: 2)
             }
             report.command = command
             if command == "help" {
@@ -139,6 +145,53 @@ enum CLICommand {
             return CLIResult(stdout: bytes, stderr: report.error.map { "retrace-cli: \($0.code): \($0.message)\n" } ?? "", exitCode: report.exitCode)
         } catch {
             return CLIResult(stdout: Data("{\"schemaVersion\":1,\"status\":\"failed\",\"exitCode\":5,\"error\":{\"code\":\"output_failed\",\"message\":\"JSON encoding failed.\"}}\n".utf8),
+                             stderr: "retrace-cli: output_failed: JSON encoding failed.\n", exitCode: 5)
+        }
+    }
+
+    private static func executeSync(arguments: [String]) async -> CLIResult {
+        let started = ProcessInfo.processInfo.systemUptime
+        var report = SyncPlan()
+        var metrics: CLIStateMetrics?
+        do {
+            let options = try parseOptions(arguments, sync: true)
+            let root = try localPath(options["--storage-root"] ?? AppPaths.storageRoot).resolvingSymlinksInPath()
+            let state = try localPath(options["--state-root"] ?? "~/Library/Application Support/RetraceCLI")
+            metrics = try CLIStateMetrics(root: state, sourceRoot: root)
+            try metrics?.record(command: "sync", outcome: "started")
+            guard options["--dry-run"] != nil else {
+                throw CLIError("upload_disabled", "Uploads await privacy-deletion, consistent snapshot and encryption contracts. See docs/decomposition/optimization-and-cloud-sync.md (Plan gates before implementation continues); use sync --dry-run.", exitCode: 6)
+            }
+            report = try await SyncPlanner.plan(root: root, state: state)
+        } catch {
+            let failure: CLIError
+            if let cliError = error as? CLIError { failure = cliError }
+            else if error as? SyncManifestError == .unsafeStateRoot {
+                failure = CLIError("unsafe_state_root", "Manifest state must be outside source storage, without symlink or hardlink aliases; choose another --state-root.", exitCode: 2)
+            } else { failure = CLIError("manifest_unavailable", "Could not read the independent sync manifest; no repair or migration was attempted.") }
+            report.status = "failed"
+            report.error = failure
+            report.exitCode = failure.exitCode
+        }
+        report.elapsedMs = max(0, (ProcessInfo.processInfo.systemUptime - started) * 1000)
+        if let metrics {
+            do {
+                try metrics.record(command: "sync", outcome: report.status == "complete" ? "succeeded" : report.status,
+                                   durationMs: report.elapsedMs, errorCode: report.error?.code)
+            } catch {
+                report.status = "failed"
+                report.exitCode = 5
+                report.error = CLIError("metrics_unavailable", "Could not persist sync outcome in independent CLI state.", exitCode: 5)
+            }
+        }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            var bytes = try encoder.encode(report)
+            bytes.append(0x0A)
+            return CLIResult(stdout: bytes, stderr: report.error.map { "retrace-cli: \($0.code): \($0.message)\n" } ?? "", exitCode: report.exitCode)
+        } catch {
+            return CLIResult(stdout: Data("{\"schemaVersion\":1,\"status\":\"failed\",\"exitCode\":5,\"error\":{\"code\":\"output_failed\"}}\n".utf8),
                              stderr: "retrace-cli: output_failed: JSON encoding failed.\n", exitCode: 5)
         }
     }
@@ -237,12 +290,17 @@ enum CLICommand {
         CLIError("usage", "Expected each of --storage-root PATH and --state-root PATH at most once; see swift run retrace-cli help.", exitCode: 2)
     }
 
-    private static func parseOptions(_ arguments: [String], export: Bool = false) throws -> [String: String] {
+    private static func parseOptions(_ arguments: [String], export: Bool = false, sync: Bool = false) throws -> [String: String] {
         let allowed = ["--storage-root", "--state-root"] + (export ? ["--day", "--limit"] : [])
         var values: [String: String] = [:]
         var index = 0
         while index < arguments.count {
             let option = arguments[index]
+            if sync, option == "--dry-run", values[option] == nil {
+                values[option] = "true"
+                index += 1
+                continue
+            }
             guard allowed.contains(option), values[option] == nil,
                   index + 1 < arguments.count, !arguments[index + 1].hasPrefix("--") else {
                 throw export ? exportUsage() : usage()
