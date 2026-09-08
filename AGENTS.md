@@ -58,6 +58,16 @@ retrace/
 ├── docs/
 │   └── decomposition/           # Staged decomposition docs for large features
 ├── Package.swift                # Swift Package Manager configuration
+├── Sources/
+│   ├── RetraceCLI/              # Read-only metadata executable product `retrace-cli`
+│   │   ├── RetraceCLI.swift     # Noninteractive entry point
+│   │   ├── CLICommand.swift     # JSON contract, usage/exit codes, metadata-only command routing
+│   │   ├── SourceDatabase.swift # Native schema/aggregate SELECTs, strict read-only source VFS
+│   │   ├── ChunkInventory.swift # Bounded descriptor-relative metadata inventory
+│   │   ├── CLIStateMetrics.swift # Independent CLI-owned daily_metrics SQLite store
+│   │   └── Tests/RetraceCLITests.swift # Temporary SQLite/FileManager contract fixtures
+│   ├── TestMostRecentFrame/     # Existing diagnostic executable
+│   └── QueryRewindApps/         # Existing Rewind query executable
 ├── scripts/                     # Build/release/validation scripts
 │   ├── release.sh               # End-to-end release automation
 │   ├── create-release.sh        # Release build + packaging helper
@@ -209,6 +219,7 @@ retrace/
 | **SEARCH**     | `Search/`     | `Search/AGENTS.md`     | Query parsing, FTS5 queries, result ranking (no vector search yet) |
 | **MIGRATION**  | `Migration/`  | `Migration/AGENTS.md`  | Import from Rewind AI (Rewind only, others planned)                |
 | **APP**        | `App/`        | —                      | Coordinator, DI container, data adapter, lifecycle management      |
+| **CLI**        | `Sources/RetraceCLI/` | root guide       | Read-only native aggregate status, bounded chunk inventory, independent CLI metrics |
 | **UI**         | `UI/`         | `UI/AGENTS.md`         | SwiftUI interface (timeline, dashboard, settings, search)          |
 
 **Rule**: Each agent should **ONLY** modify files in their assigned module directory. Cross-module changes require explicit coordination.

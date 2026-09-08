@@ -29,6 +29,7 @@ let package = Package(
         .library(name: "App", targets: ["App"]),
         .library(name: "CrashRecoverySupport", targets: ["CrashRecoverySupport"]),
         .executable(name: "Retrace", targets: ["Retrace"]),
+        .executable(name: "retrace-cli", targets: ["RetraceCLI"]),
         .executable(name: "RetraceCrashRecoveryHelper", targets: ["RetraceCrashRecoveryHelper"]),
         .executable(name: "TestMostRecentFrame", targets: ["TestMostRecentFrame"]),
         .executable(name: "QueryRewindApps", targets: ["QueryRewindApps"]),
@@ -261,6 +262,19 @@ let package = Package(
             sources: [
                 "main.swift"
             ]
+        ),
+
+        // MARK: - Read-only metadata CLI (no application bootstrap)
+        .executableTarget(
+            name: "RetraceCLI",
+            dependencies: ["Shared", "Database", .product(name: "SQLCipher", package: "swift-sqlcipher")],
+            path: "Sources/RetraceCLI",
+            exclude: ["Tests"]
+        ),
+        .testTarget(
+            name: "RetraceCLITests",
+            dependencies: ["RetraceCLI", "Database", "Shared", .product(name: "SQLCipher", package: "swift-sqlcipher")],
+            path: "Sources/RetraceCLI/Tests"
         ),
 
         // MARK: - Test executable for getMostRecentFrameTimestamp

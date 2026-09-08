@@ -29,6 +29,9 @@ public enum DailyMetricsQueries {
 
     /// Standard metric type identifiers
     public enum MetricType: String, Sendable {
+        // CLI-owned independent daily_metrics store only; never emitted into source retrace.db.
+        // metadata: JSON {command, outcome: started/succeeded/failed/partial, durationMs?, errorCode?}; no paths/content/keys.
+        case cliCommand = "cli_command"
         case timelineOpens = "timeline_opens"
         case searches = "searches"
         case textCopies = "text_copies"
