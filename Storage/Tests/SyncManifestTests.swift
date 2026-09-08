@@ -168,4 +168,86 @@ final class SyncManifestTests: XCTestCase {
             XCTFail("Unsafe state root was accepted")
         } catch { XCTAssertEqual(error as? SyncManifestError, .unsafeStateRoot) }
     }
+
+    func testSnapshotLineageMigrationPreservesLegacyObjectsAndPersistsRows() async throws {
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        let path = state.appendingPathComponent(SyncManifest.filename)
+        var legacy: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path.path, &legacy), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(legacy, """
+            CREATE TABLE objects(key TEXT PRIMARY KEY,sha256 TEXT,sizeBytes INTEGER,mtimeNs INTEGER,
+                revision INTEGER,uploadState TEXT,uploadedAt INTEGER,contentTag TEXT);
+            INSERT INTO objects VALUES('one','\(firstHash)',42,123,1,'uploaded',456,'tag');
+            """, nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_close(legacy), SQLITE_OK)
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: source)
+        let object = try await manifest.lookup(key: "one")
+        XCTAssertEqual(object?.uploadState, .uploaded)
+        XCTAssertEqual(object?.sizeBytes, 42)
+        try await manifest.close()
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path.path, &db), SQLITE_OK)
+        let insert = "INSERT INTO snapshots(createdMs,sizeBytes,sha256,frameCount,videoCount,lineageTag,snapshotPath) VALUES(123,42,'\(firstHash)',2,1,'sqlite-online-backup-v1','/fixture/123.db')"
+        XCTAssertEqual(sqlite3_exec(db, insert, nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "UPDATE snapshots SET frameCount=-1", nil, nil, nil), SQLITE_CONSTRAINT)
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let reopened = try await SyncManifest.open(root: state, sourceRoot: source)
+        try await reopened.close()
+        XCTAssertEqual(sqlite3_open_v2(path.path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        let prepared = sqlite3_prepare_v2(db, "SELECT createdMs,sizeBytes,sha256,frameCount,videoCount,lineageTag,snapshotPath FROM snapshots", -1, &statement, nil)
+        XCTAssertEqual(prepared, SQLITE_OK)
+        guard prepared == SQLITE_OK else { return }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int64(statement, 0), 123)
+        XCTAssertEqual(sqlite3_column_int64(statement, 1), 42)
+        XCTAssertEqual(String(cString: sqlite3_column_text(statement, 2)), firstHash)
+        XCTAssertEqual(sqlite3_column_int64(statement, 3), 2)
+        XCTAssertEqual(sqlite3_column_int64(statement, 4), 1)
+        XCTAssertEqual(String(cString: sqlite3_column_text(statement, 5)), "sqlite-online-backup-v1")
+        XCTAssertEqual(String(cString: sqlite3_column_text(statement, 6)), "/fixture/123.db")
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+    }
+
+    func testSnapshotLookupPrefersLatestPathThenFallsBackToHashAcrossReopen() async throws {
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: source)
+        _ = try await manifest.recordSnapshot(createdMs: 100, sizeBytes: 42, sha256: firstHash,
+            frameCount: 2, videoCount: 1, lineageTag: "test", snapshotPath: "/fixture/one.db")
+        _ = try await manifest.recordSnapshot(createdMs: 200, sizeBytes: 50, sha256: secondHash,
+            frameCount: 3, videoCount: 1, lineageTag: "test", snapshotPath: "/fixture/one.db")
+        let latest = try await manifest.recordSnapshot(createdMs: 200, sizeBytes: 51, sha256: secondHash,
+            frameCount: 4, videoCount: 2, lineageTag: "test", snapshotPath: "/fixture/one.db")
+        let other = try await manifest.recordSnapshot(createdMs: 300, sizeBytes: 42, sha256: firstHash,
+            frameCount: 2, videoCount: 1, lineageTag: "test", snapshotPath: "/fixture/two.db")
+        try await manifest.close()
+        let readonly = try await SyncManifest.open(root: state, sourceRoot: source, readOnly: true)
+        let pathMatch = try await readonly.lookupSnapshot(sha256: firstHash, snapshotPath: "/fixture/one.db")
+        XCTAssertEqual(pathMatch, latest)
+        let hashMatch = try await readonly.lookupSnapshot(sha256: firstHash, snapshotPath: "/fixture/moved.db")
+        XCTAssertEqual(hashMatch, other)
+        do {
+            _ = try await readonly.recordSnapshot(createdMs: 400, sizeBytes: 42, sha256: firstHash,
+                frameCount: 2, videoCount: 1, lineageTag: "test", snapshotPath: "/fixture/three.db")
+            XCTFail("Read-only lineage accepted a write")
+        } catch { XCTAssertEqual(error as? SyncManifestError, .readOnly) }
+        try await readonly.close()
+    }
+
+    func testSnapshotLookupDoesNotMigrateLegacyReadOnlyManifest() async throws {
+        let manifest = try await SyncManifest.open(root: state, sourceRoot: source)
+        try await manifest.close()
+        let path = state.appendingPathComponent(SyncManifest.filename)
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path.path, &db), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "DROP TABLE snapshots", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let before = try Data(contentsOf: path)
+        let readonly = try await SyncManifest.open(root: state, sourceRoot: source, readOnly: true)
+        let missing = try await readonly.lookupSnapshot(sha256: firstHash, snapshotPath: "/fixture/one.db")
+        XCTAssertNil(missing)
+        try await readonly.close()
+        XCTAssertEqual(try Data(contentsOf: path), before)
+    }
 }

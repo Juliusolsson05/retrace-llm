@@ -255,7 +255,7 @@ enum SourceDatabase {
     }
 }
 
-private enum ReadOnlySourceVFS {
+enum ReadOnlySourceVFS {
     static let name = "retrace-cli-readonly"
     // SQLite's built-in Unix VFS opens WAL with CREATE even for a read-only main DB.
     // This process-lifetime, nondefault VFS denies creation/deletion and forces read-only

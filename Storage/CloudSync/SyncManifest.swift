@@ -24,6 +24,17 @@ public actor SyncManifest {
         public let contentTag: String?
     }
 
+    public struct Snapshot: Sendable, Equatable {
+        public let id: Int64
+        public let createdMs: Int64
+        public let sizeBytes: Int64
+        public let sha256: String
+        public let frameCount: Int64
+        public let videoCount: Int64
+        public let lineageTag: String
+        public let snapshotPath: String
+    }
+
     private var db: OpaquePointer?
     private let readOnly: Bool
     private var isClosed = false
@@ -89,6 +100,18 @@ public actor SyncManifest {
                         uploadedAt INTEGER,
                         contentTag TEXT
                     );
+                    CREATE TABLE IF NOT EXISTS snapshots (
+                        id INTEGER PRIMARY KEY,
+                        createdMs INTEGER NOT NULL CHECK(createdMs >= 0),
+                        sizeBytes INTEGER NOT NULL CHECK(sizeBytes > 0),
+                        sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
+                        frameCount INTEGER NOT NULL CHECK(frameCount >= 0),
+                        videoCount INTEGER NOT NULL CHECK(videoCount >= 0),
+                        lineageTag TEXT NOT NULL,
+                        snapshotPath TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS snapshots_by_path ON snapshots(snapshotPath,createdMs DESC,id DESC);
+                    CREATE INDEX IF NOT EXISTS snapshots_by_hash ON snapshots(sha256,createdMs DESC,id DESC);
                     COMMIT;
                     """)
             }
@@ -122,6 +145,69 @@ public actor SyncManifest {
 
     public func listPending() throws -> [Object] {
         try rows(sql: "SELECT key,sha256,sizeBytes,mtimeNs,revision,uploadState,uploadedAt,contentTag FROM objects WHERE uploadState='pending' ORDER BY key")
+    }
+
+    @discardableResult
+    public func recordSnapshot(createdMs: Int64, sizeBytes: Int64, sha256: String, frameCount: Int64,
+                               videoCount: Int64, lineageTag: String, snapshotPath: String) throws -> Snapshot {
+        try transaction { db in
+            guard createdMs >= 0, sizeBytes > 0, frameCount >= 0, videoCount >= 0,
+                  sha256.utf8.count == 64, sha256.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+                  !lineageTag.isEmpty, !lineageTag.contains("\0"), snapshotPath.hasPrefix("/"),
+                  !snapshotPath.contains("\0") else { throw SyncManifestError.invalidRecord }
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            try Self.prepare(db, """
+                INSERT INTO snapshots(createdMs,sizeBytes,sha256,frameCount,videoCount,lineageTag,snapshotPath)
+                VALUES(?,?,?,?,?,?,?)
+                """, &statement)
+            sqlite3_bind_int64(statement, 1, createdMs)
+            sqlite3_bind_int64(statement, 2, sizeBytes)
+            try Self.bind(sha256, to: statement, at: 3)
+            sqlite3_bind_int64(statement, 4, frameCount)
+            sqlite3_bind_int64(statement, 5, videoCount)
+            try Self.bind(lineageTag, to: statement, at: 6)
+            try Self.bind(snapshotPath, to: statement, at: 7)
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw SyncManifestError.unavailable }
+            return Snapshot(id: sqlite3_last_insert_rowid(db), createdMs: createdMs, sizeBytes: sizeBytes,
+                            sha256: sha256, frameCount: frameCount, videoCount: videoCount,
+                            lineageTag: lineageTag, snapshotPath: snapshotPath)
+        }
+    }
+
+    public func lookupSnapshot(sha256: String, snapshotPath: String) throws -> Snapshot? {
+        guard !isClosed else { throw SyncManifestError.closed }
+        guard let db else { return nil }
+        var table: OpaquePointer?
+        defer { sqlite3_finalize(table) }
+        try Self.prepare(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='snapshots'", &table)
+        let status = sqlite3_step(table)
+        // A slice-5 manifest remains readable without migrating during verify/dry-run.
+        if status == SQLITE_DONE { return nil }
+        guard status == SQLITE_ROW else { throw SyncManifestError.unavailable }
+        // A known path must match its own latest lineage, even if substituted bytes
+        // happen to match another snapshot. Hash fallback permits moved/copied backups.
+        for (column, value) in [("snapshotPath", snapshotPath), ("sha256", sha256)] {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            try Self.prepare(db, """
+                SELECT id,createdMs,sizeBytes,sha256,frameCount,videoCount,lineageTag,snapshotPath
+                FROM snapshots WHERE \(column)=? ORDER BY createdMs DESC,id DESC LIMIT 1
+                """, &statement)
+            try Self.bind(value, to: statement, at: 1)
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE { continue }
+            guard result == SQLITE_ROW else { throw SyncManifestError.unavailable }
+            func text(_ index: Int32) throws -> String {
+                guard let bytes = sqlite3_column_text(statement, index) else { throw SyncManifestError.unavailable }
+                return String(cString: bytes)
+            }
+            return Snapshot(id: sqlite3_column_int64(statement, 0), createdMs: sqlite3_column_int64(statement, 1),
+                            sizeBytes: sqlite3_column_int64(statement, 2), sha256: try text(3),
+                            frameCount: sqlite3_column_int64(statement, 4), videoCount: sqlite3_column_int64(statement, 5),
+                            lineageTag: try text(6), snapshotPath: try text(7))
+        }
+        return nil
     }
 
     @discardableResult

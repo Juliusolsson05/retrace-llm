@@ -665,6 +665,277 @@ final class RetraceCLITests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["retrace.db"])
     }
 
+    private func snapshot() async throws -> (URL, [String: Any]) {
+        let result = await run("snapshot")
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        let report = try json(result)
+        let path = try XCTUnwrap(report["snapshotPath"] as? String)
+        XCTAssertTrue(path.hasPrefix(state.path + "/snapshots/"))
+        XCTAssertNotNil(Int64(URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent))
+        return (URL(fileURLWithPath: path), report)
+    }
+
+    private func snapshotReadCounts(_ file: URL, frames: Int64, videos: Int64) throws {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(file.path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_db_readonly(db, "main"), 1)
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &statement, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        XCTAssertEqual(String(cString: sqlite3_column_text(statement, 0)), "ok")
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+        sqlite3_finalize(statement)
+        statement = nil
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT (SELECT COUNT(*) FROM frame), (SELECT COUNT(*) FROM video)", -1, &statement, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int64(statement, 0), frames)
+        XCTAssertEqual(sqlite3_column_int64(statement, 1), videos)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+        XCTAssertEqual(sqlite3_exec(db, "DELETE FROM frame", nil, nil, nil), SQLITE_READONLY)
+    }
+
+    func testSnapshotIncludesCommittedWALWhileWriterTransactionRemainsOpen() async throws {
+        try await initialize(seed: true)
+        let writer = try openFixture()
+        defer { sqlite3_exec(writer, "ROLLBACK", nil, nil, nil); sqlite3_close(writer) }
+        try exec(writer, """
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            BEGIN IMMEDIATE;
+            INSERT INTO frame(createdAt,imageFileName) VALUES(9000,'committed-wal');
+            COMMIT;
+            BEGIN IMMEDIATE;
+            INSERT INTO frame(createdAt,imageFileName) VALUES(10000,'uncommitted-wal');
+            """)
+        let before = try Data(contentsOf: database)
+        let wal = URL(fileURLWithPath: database.path + "-wal")
+        let walBefore = try Data(contentsOf: wal)
+        // The DB header alone cannot contain the committed third row: it is still in WAL.
+        let naive = sandbox.appendingPathComponent("naive.db")
+        try before.write(to: naive)
+        try snapshotReadCounts(naive, frames: 2, videos: 1)
+        let (file, report) = try await snapshot()
+        XCTAssertEqual(report["frameCount"] as? Int, 3)
+        XCTAssertEqual(report["videoCount"] as? Int, 1)
+        XCTAssertEqual(report["integrity"] as? String, "ok")
+        try snapshotReadCounts(file, frames: 3, videos: 1)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: file.deletingLastPathComponent().path), [file.lastPathComponent])
+        XCTAssertEqual(try Data(contentsOf: database), before)
+        XCTAssertEqual(try Data(contentsOf: wal), walBefore)
+    }
+
+    func testSnapshotEmptyMigratedSchemaAndUniqueFiles() async throws {
+        try await initialize()
+        let (file, report) = try await snapshot()
+        let (second, _) = try await snapshot()
+        XCTAssertNotEqual(file, second)
+        XCTAssertEqual(report["frameCount"] as? Int, 0)
+        XCTAssertEqual(report["videoCount"] as? Int, 0)
+        XCTAssertGreaterThan(try XCTUnwrap(report["sizeBytes"] as? Int), 0)
+        XCTAssertEqual((report["sha256"] as? String)?.count, 64)
+        try snapshotReadCounts(file, frames: 0, videos: 0)
+    }
+
+    func testSnapshotCopiesMultiplePageBatchesAndLockedSourceFailsWithoutArtifacts() async throws {
+        try await initialize(seed: true)
+        let writer = try openFixture()
+        defer { sqlite3_exec(writer, "ROLLBACK", nil, nil, nil); sqlite3_close(writer) }
+        try exec(writer, "CREATE TABLE fixture_payload(value BLOB); INSERT INTO fixture_payload VALUES(zeroblob(2097152))")
+        let (file, report) = try await snapshot()
+        XCTAssertGreaterThan(try XCTUnwrap(report["sizeBytes"] as? Int), 2_097_152)
+        try snapshotReadCounts(file, frames: 2, videos: 1)
+        let directory = file.deletingLastPathComponent()
+        let before = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        try exec(writer, "BEGIN EXCLUSIVE")
+        let start = ProcessInfo.processInfo.systemUptime
+        let locked = await run("snapshot")
+        XCTAssertNotEqual(locked.exitCode, 0)
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 15)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), before)
+    }
+
+    func testRestoreRejectsCorruptSnapshotWithoutLeavingDatabase() async throws {
+        try await initialize()
+        let (file, _) = try await snapshot()
+        try Data([0]).write(to: file)
+        let target = sandbox.appendingPathComponent("restore-corrupt")
+        try assertError(await run("restore", extra: ["--snapshot", file.path, "--to", target.path]), "snapshot_integrity_failed")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: target.path), [])
+    }
+
+    func testVerifyUnsafeInputRecordsFailureAndMetricsAliasIsNeverModified() async throws {
+        try await initialize()
+        let before = try Data(contentsOf: database)
+        try assertError(await run("verify", extra: ["--snapshot", database.path]), "unsafe_snapshot")
+        let metrics = state.appendingPathComponent("metrics.db")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: metrics.path))
+        guard FileManager.default.fileExists(atPath: metrics.path) else { return }
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(metrics.path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT metadata FROM daily_metrics ORDER BY id", -1, &statement, nil), SQLITE_OK)
+        for outcome in ["started", "failed"] {
+            XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+            let text = String(cString: try XCTUnwrap(sqlite3_column_text(statement, 0)))
+            let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+            XCTAssertEqual(metadata["outcome"] as? String, outcome)
+        }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+        sqlite3_finalize(statement)
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let metricsBefore = try Data(contentsOf: metrics)
+        try assertError(await run("verify", extra: ["--snapshot", metrics.path]), "unsafe_snapshot")
+        XCTAssertEqual(try Data(contentsOf: metrics), metricsBefore)
+        XCTAssertEqual(try Data(contentsOf: database), before)
+    }
+
+    func testSnapshotVerifyMatchesLineageAndMovedCopyWithoutManifestWrites() async throws {
+        try await initialize(seed: true)
+        let (file, report) = try await snapshot()
+        let manifest = state.appendingPathComponent(SyncManifest.filename)
+        let before = try Data(contentsOf: manifest)
+        for candidate in [file, sandbox.appendingPathComponent("moved.db")] {
+            if candidate != file { try FileManager.default.copyItem(at: file, to: candidate) }
+            let result = await run("verify", extra: ["--snapshot", candidate.path])
+            XCTAssertEqual(result.exitCode, 0, result.stderr)
+            let verified = try json(result)
+            XCTAssertEqual(verified["sha256"] as? String, report["sha256"] as? String)
+            XCTAssertEqual(verified["checks"] as? [String: String], ["manifest": "match", "sha256": "match", "sizeBytes": "match", "frameCount": "match", "videoCount": "match", "integrity": "match"])
+            XCTAssertGreaterThan(try XCTUnwrap(verified["lineageId"] as? Int), 0)
+        }
+        XCTAssertEqual(try Data(contentsOf: manifest), before)
+    }
+
+    func testVerifyTamperedByteReportsSHA256MismatchEvenWhenDatabaseIsCorrupt() async throws {
+        try await initialize(seed: true)
+        let (file, _) = try await snapshot()
+        let handle = try FileHandle(forUpdating: file)
+        try handle.write(contentsOf: Data([0])) // Corrupt SQLite's magic, preserving size.
+        try handle.close()
+        let result = await run("verify", extra: ["--snapshot", file.path])
+        XCTAssertNotEqual(result.exitCode, 0)
+        let report = try json(result)
+        let checks = try XCTUnwrap(report["checks"] as? [String: String])
+        XCTAssertEqual(checks["sha256"], "mismatch")
+        XCTAssertEqual(checks["sizeBytes"], "match")
+        XCTAssertEqual(checks["integrity"], "mismatch")
+        XCTAssertEqual(checks["frameCount"], "unavailable")
+    }
+
+    func testVerifyReportsEveryManifestFieldMismatchAndMissingLineage() async throws {
+        try await initialize(seed: true)
+        let (file, _) = try await snapshot()
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(state.appendingPathComponent(SyncManifest.filename).path, &db), SQLITE_OK)
+        try exec(XCTUnwrap(db), "UPDATE snapshots SET sizeBytes=sizeBytes+1, frameCount=frameCount+1, videoCount=videoCount+1")
+        XCTAssertEqual(sqlite3_close(db), SQLITE_OK)
+        let result = await run("verify", extra: ["--snapshot", file.path])
+        XCTAssertNotEqual(result.exitCode, 0)
+        let checks = try XCTUnwrap(try json(result)["checks"] as? [String: String])
+        for field in ["sizeBytes", "frameCount", "videoCount"] { XCTAssertEqual(checks[field], "mismatch") }
+        XCTAssertEqual(checks["sha256"], "match")
+        try FileManager.default.removeItem(at: state.appendingPathComponent(SyncManifest.filename))
+        let missing = await run("verify", extra: ["--snapshot", file.path])
+        XCTAssertNotEqual(missing.exitCode, 0)
+        XCTAssertEqual((try json(missing)["checks"] as? [String: String])?["manifest"], "missing")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.appendingPathComponent(SyncManifest.filename).path))
+    }
+
+    func testRestoreOpensReadOnlyWithExpectedCountsAndLeavesSourceUnchanged() async throws {
+        try await initialize(seed: true)
+        let before = try Data(contentsOf: database)
+        let (file, _) = try await snapshot()
+        for name in ["new-target", "existing-empty-target"] {
+            let target = sandbox.appendingPathComponent(name)
+            if name.hasPrefix("existing") { try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false) }
+            let result = await run("restore", extra: ["--snapshot", file.path, "--to", target.path])
+            XCTAssertEqual(result.exitCode, 0, result.stderr)
+            let report = try json(result)
+            XCTAssertEqual(report["integrity"] as? String, "ok")
+            XCTAssertEqual(report["frameCount"] as? Int, 2)
+            XCTAssertEqual(report["videoCount"] as? Int, 1)
+            try snapshotReadCounts(target.appendingPathComponent("retrace.db"), frames: 2, videos: 1)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: target.path), ["retrace.db"])
+        }
+        XCTAssertEqual(try Data(contentsOf: database), before)
+    }
+
+    func testRestoreRefusesNonemptySourceInsideAndSymlinkTargets() async throws {
+        try await initialize(seed: true)
+        let (file, _) = try await snapshot()
+        let occupied = sandbox.appendingPathComponent("occupied")
+        try FileManager.default.createDirectory(at: occupied, withIntermediateDirectories: false)
+        try Data("sentinel".utf8).write(to: occupied.appendingPathComponent(".keep"))
+        try assertError(await run("restore", extra: ["--snapshot", file.path, "--to", occupied.path]), "target_not_empty")
+        let alias = sandbox.appendingPathComponent("source-alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: root)
+        for target in [root, root.appendingPathComponent("restore"), alias.appendingPathComponent("restore")] {
+            try assertError(await run("restore", extra: ["--snapshot", file.path, "--to", target.path]), "unsafe_restore_target")
+        }
+        let empty = sandbox.appendingPathComponent("empty")
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: false)
+        let outsideAlias = sandbox.appendingPathComponent("outside-alias")
+        try FileManager.default.createSymbolicLink(at: outsideAlias, withDestinationURL: empty)
+        try assertError(await run("restore", extra: ["--snapshot", file.path, "--to", outsideAlias.path]), "unsafe_restore_target")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: empty.path), [])
+        XCTAssertEqual(try String(contentsOf: occupied.appendingPathComponent(".keep")), "sentinel")
+    }
+
+    func testSnapshotRejectsSourceContainedStateAndSymlinkSnapshotDirectory() async throws {
+        try await initialize()
+        for destination in [root, root.appendingPathComponent("state")] {
+            try assertError(await CLICommand.run(arguments: ["snapshot", "--storage-root", root.path, "--state-root", destination.path]), "unsafe_state_root")
+        }
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: false)
+        try FileManager.default.createSymbolicLink(at: state.appendingPathComponent("snapshots"), withDestinationURL: root)
+        try assertError(await run("snapshot"), "unsafe_state_root")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["retrace.db"])
+    }
+
+    func testVerifyAndRestoreRefuseSourceSnapshotsAndLinkedFiles() async throws {
+        try await initialize()
+        let alias = sandbox.appendingPathComponent("alias.db")
+        let hardlink = sandbox.appendingPathComponent("hardlink.db")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: database)
+        try FileManager.default.linkItem(at: database, to: hardlink)
+        for file in [database, alias, hardlink] {
+            try assertError(await run("verify", extra: ["--snapshot", file.path]), "unsafe_snapshot")
+            try assertError(await run("restore", extra: ["--snapshot", file.path, "--to", sandbox.appendingPathComponent("restore").path]), "unsafe_snapshot")
+        }
+    }
+
+    func testSnapshotCommandsRecordOnlyCommandOutcomesAndRejectInvalidOptions() async throws {
+        for (command, extra) in [("snapshot", ["--snapshot", "x"]), ("verify", []), ("restore", ["--snapshot", "x"]), ("verify", ["--snapshot", "x", "--snapshot", "y"])] {
+            try assertError(await run(command, extra: extra), "usage")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.path))
+        try await initialize()
+        let (file, _) = try await snapshot()
+        _ = await run("verify", extra: ["--snapshot", file.path])
+        _ = await run("restore", extra: ["--snapshot", file.path, "--to", sandbox.appendingPathComponent("restored").path])
+        _ = await run("restore", extra: ["--snapshot", file.path, "--to", root.path])
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(state.appendingPathComponent("metrics.db").path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT metadata FROM daily_metrics WHERE metricType='cli_command' ORDER BY id", -1, &statement, nil), SQLITE_OK)
+        for (command, outcomes) in [("snapshot", ["started", "succeeded"]), ("verify", ["started", "succeeded"]), ("restore", ["started", "succeeded"]), ("restore", ["started", "failed"])] {
+            for outcome in outcomes {
+                XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+                let text = String(cString: sqlite3_column_text(statement, 0))
+                let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+                XCTAssertEqual(metadata["command"] as? String, command)
+                XCTAssertEqual(metadata["outcome"] as? String, outcome)
+                XCTAssertFalse(text.contains(sandbox.path))
+                XCTAssertTrue(Set(metadata.keys).isSubset(of: ["command", "outcome", "durationMs", "errorCode"]))
+            }
+        }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+    }
+
     func testRejectsMemoryURIAndEmptyPaths() async throws {
         for path in ["", " ", ":memory:", "file:/tmp/retrace?mode=ro", "https://example.com", "fake?mode=memory"] {
             try assertError(await CLICommand.run(arguments: ["status", "--storage-root", path, "--state-root", state.path]), "invalid_path")

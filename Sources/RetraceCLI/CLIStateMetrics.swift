@@ -98,7 +98,7 @@ final class CLIStateMetrics {
         CLIError("unsafe_state_root", "CLI state must be outside source storage, with no symlink components or hardlinked metric files. Choose another --state-root.", exitCode: 2)
     }
 
-    private static func canonicalPath(_ url: URL) throws -> String {
+    static func canonicalPath(_ url: URL) throws -> String {
         var path = url.path
         var suffix: [String] = []
         // Resolve the existing ancestor even when the requested source/state is missing.
