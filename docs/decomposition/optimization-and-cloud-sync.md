@@ -135,6 +135,28 @@ Forbidden: `UI/` importing sync internals; sync writing anywhere in local storag
 
 ---
 
+## Audited candidate backlog (swarm audit 2026-09-08, run `opt-hunt` — all magnitudes are static hypotheses until Stage 0 measures)
+
+Beyond the Track A stage items, the 8-agent module sweep found:
+
+**Search** — serial per-hit frame hydration, N DB calls per search (`SearchManager.swift:115`); late relevance filtering after expensive hydration (`:145`); repeated metadata matching per hit (`ResultRanker.swift:113`); DateFormatter churn up to 8/query (`QueryParser.swift:132`); unbounded timing history (`SearchManager.swift:151,275`).
+
+**Database** — FTS content+junction inserts commit separately, 2→1 / 4→1 commits per frame (`FTSQueries.swift:144`); in-page URL read/write re-validates schema ~34 SQL statements per operation (`FrameQueries.swift:284`); fallback search aggregates ALL `doc_segment` rows before matching, potential 10–100× on large DBs (`FTSManager.swift:296`); bulk deletion re-prepares ~50k statements per 10k frames (`FrameQueries.swift:1218`); statement pointer overwrite leak in legacy document path (`DocumentQueries.swift:47,134`).
+
+**Storage/WAL** — every append invalidates the offset index → header rescan (150 frames → 11,325 header reads; `WALManager.swift:244,307,1082`); path-cache miss enumerates the entire archive, O(M×N) under retention (`StorageManager.swift:1288`, `DirectoryManager.swift:70`); recovery rewrites raw pixels into new WALs (~4.63 GiB per 150 4K frames; `RecoveryManager.swift:745,756,763`); prefix repair loads full payloads when only metadata is needed (31.6 MiB/frame; `RecoveryManager.swift:579`); ImageExtractor lacks in-flight join → duplicate generator setups (`ImageExtractor.swift:418,639`).
+
+**Capture/metadata** — repeated AX walks on URL misses, roughly half overlapping (`BrowserURLExtractor.swift:584,848,1208`); private-window detection N×(1+2M) AX calls per attempt (`CGWindowListCapture.swift:552`, `PrivateWindowDetector.swift:81`); full 4WH BGRA allocation before dedup (31.6 MiB @4K, ~15.8 MiB/s at 0.5 Hz; `CGWindowListCapture.swift:1355,1189`); duplicate window/app metadata enumerations per retained frame (`CaptureManager.swift:1085`, `AppInfoProvider.swift:152`); lock state checked after expensive exclusion work (`CGWindowListCapture.swift:328`).
+
+**App/UI** — serial startup init chain; retention cleanup runs full orphan-node scan + conditional vacuum; date query groups full frame history per dashboard/calendar load (no cache); timeline disk-buffer clear on the main actor → navigation freeze (`SimpleTimelineViewModel.swift:3194,3136,7922`); filesystem probes in view builders per evaluation (`SimpleTimelineView.swift:942,958`); hide destroys the timeline hosting view → full reopen reconstruction (`TimelineWindowController.swift:1911,1981`, `TimelineTapeView.swift:438`); `NSImage(data:)` resumes on main (`SimpleTimelineViewModel.swift:10571,8778`); unstable block IDs on prepend/trim (`SimpleTimelineViewModel.swift:357`, `TimelineTapeView.swift:295`); dashboard range loads issue one storage query per day; saved-search thumbnails trigger full cache-dir scans; settings render path checks path availability.
+
+**Memory/energy** — idle-retained video generators ~128 MiB (eviction only fires on access; `ImageExtractor.swift:160`); `previousFrame` BGRA retained after OCR drains, 31.6 MiB @4K (`ProcessingManager.swift:160`); scrambler inverse-permutation allocations 15–20 MiB (`ReversibleOCRScrambler.swift:251`); watchdog 100 ms heartbeat + 200 ms check ≈ 54k executions/hour incl. paused (`Logging.swift:1351`); eager debug-string logging writes synchronously to disk — reminder ticks alone 1,800 writes/hour (`Logging.swift:85`, `PauseReminderManager.swift:164`); hidden dashboard timer still fires, 3,600 callbacks/hidden-hour (`DashboardViewModel.swift:325`).
+
+### Integrity red flags (verify, then file issues per conventions — do NOT optimize past these)
+
+1. **WAL durable-frontier stale overwrite** — `WALManager.swift:270` persists the durable video frontier, but `:234` later saves writer session metadata that may overwrite it with stale values; crash window between appends. Verify + fix before any WAL write-path optimization.
+2. **Checkpoint completion misreported** — `DatabaseManager.swift:3482` discards checkpoint result rows and treats `SQLITE_OK` as completion; a blocked checkpoint reads as success.
+3. **Statement leak** — `DocumentQueries.swift:47,134` overwrites the prepared-statement pointer without finalizing; hundreds of MB possible over long importer runs.
+
 ## Unknowns (explicit)
 
 1. **Which optimization candidates survive measurement** — Stage 0 may show some "obvious" wins are noise; the gate decides, not intuition.
