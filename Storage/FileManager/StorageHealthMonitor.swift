@@ -435,16 +435,48 @@ public struct DiskSpaceMonitor {
     public static func availableBytes(at url: URL) throws -> Int64 {
         do {
             let values = try url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-            if let cap = values.volumeAvailableCapacityForImportantUsage {
-                return Int64(cap)
-            }
-            let fs = try FileManager.default.attributesOfFileSystem(forPath: url.path)
-            if let free = fs[.systemFreeSize] as? NSNumber {
-                return free.int64Value
-            }
-            return 0
+            let attributes = try FileManager.default.attributesOfFileSystem(forPath: url.path)
+
+            return resolveAvailableBytes(
+                importantUsage: values.volumeAvailableCapacityForImportantUsage,
+                systemFree: (attributes[.systemFreeSize] as? NSNumber)?.int64Value
+            )
         } catch {
             throw StorageError.fileReadFailed(path: url.path, underlying: error.localizedDescription)
         }
+    }
+
+    /// Chooses between the two capacity readings the OS offers.
+    ///
+    /// `importantUsage` is the better number when it is trustworthy, because it counts
+    /// purgeable content the system would evict on demand rather than only literal free
+    /// blocks. But it cannot be taken at face value:
+    ///
+    /// macOS 26.x returns a *present* zero from that key on every APFS volume — verified
+    /// on a freshly created, completely empty sparse image as well as on a system disk
+    /// with 129 GB free. The cause sits below Foundation: `getattrlist` reports
+    /// `ATTR_VOL_QUOTA_SIZE = 0` and `ATTR_VOL_RESERVED_SIZE = 0` on APFS, and the
+    /// important/opportunistic figures are derived as `max(0, quota - used)`, which
+    /// collapses to zero. `ATTR_VOL_SPACEAVAIL` and `statvfs` stay correct throughout,
+    /// which is why `systemFreeSize` is a sound fallback.
+    ///
+    /// The previous implementation used a plain `if let`, which binds that zero happily,
+    /// so the fallback below it was unreachable and this returned 0 forever. That is not
+    /// cosmetic: `StorageHealthMonitor.checkDiskSpace` compares the result against
+    /// `stopThresholdGB` (0.5) every 30 seconds and fires `onCriticalError`, halting
+    /// capture and telling the user to free up disk space they already have.
+    ///
+    /// Zero from *both* sources is still reported as zero — a genuinely full disk must
+    /// keep triggering the critical-storage stop path.
+    ///
+    /// Both readings are now taken up front rather than the fallback being computed
+    /// lazily. `attributesOfFileSystem` is a single `statfs`, and this runs once per
+    /// 30-second health check, so the cost is irrelevant next to having one unambiguous
+    /// place where the rule lives.
+    static func resolveAvailableBytes(importantUsage: Int64?, systemFree: Int64?) -> Int64 {
+        if let importantUsage, importantUsage > 0 {
+            return importantUsage
+        }
+        return systemFree ?? 0
     }
 }

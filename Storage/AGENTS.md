@@ -22,8 +22,10 @@ Storage/
 │   └── FrameConverter.swift     # Pixel format conversion
 └── Tests/
     ├── StorageManagerTests.swift
-    ├── EncryptionTests.swift
-    └── HEVCEncoderTests.swift
+    ├── DirectoryManagerTests.swift
+    ├── DiskSpaceMonitorTests.swift
+    ├── HEVCEncoderTests.swift
+    └── TestLogger.swift
 ```
 
 ## Protocols You Must Implement
