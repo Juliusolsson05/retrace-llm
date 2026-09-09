@@ -2,7 +2,7 @@
 
 - **Status:** REVISED 2026-09-08 — implementation approved for Stage 1. Phase 1's cloud-sync/CLI track shipped on `feat/phase1-foundation` (b1ec7e3…583763a: B2 sync, snapshots, deletion ledger, encryption, gated uploads, baseline harness, frame-evidence CLI). Phase 1's Track A (performance optimization) is explicitly deferred, not blocked: attribution reads are observational and Track A lands separately without contract changes.
 - **Date:** 2026-09-07 (revised 2026-09-07: build order cloud → CLI → LLM; **revised 2026-09-08: harness language reversed from Python to Swift**, see Locked decisions)
-- **Branch:** `feat/project-time-attribution` (branched from `feat/phase1-foundation`)
+- **Branch:** `feat/attribution` (renamed 2026-09-08 from `feat/project-time-attribution`; branched from `feat/phase1-foundation`. The harness itself develops in the separate `retrace-attribution` repository, which consumes this repo's RetraceKit product via SwiftPM — one-way dependency, app never links the harness.)
 - **Methodology:** staged-decomposition (each stage produces a named, independently verifiable artifact; real fixtures, never imagination)
 
 ---
