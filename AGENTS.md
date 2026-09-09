@@ -58,12 +58,6 @@ retrace/
 ├── docs/
 │   └── decomposition/           # Staged decomposition docs for large features
 ├── Package.swift                # Swift Package Manager configuration
-├── Attribution/                 # Realtime project-time-attribution harness (depends ONLY on RetraceKit + Storage)
-│   ├── AttributionStore.swift    # Own-state SQLite: classified blocks + resume checkpoint, never writes recording data
-│   ├── BlockBuilder.swift        # Progressive segmentation: app/window switch, capture gap, max span
-│   ├── GeminiClient.swift        # Minimal generateContent client: JSON-mode output, inline JPEGs, injectable transport
-│   ├── LiveClassifier.swift      # Watch → close → enrich (OCR + ≤768px JPEG) → classify → store, crash-resumable
-│   └── Tests/AttributionTests.swift # Store idempotency/checkpoint, segmentation, replayed LLM responses
 ├── Sources/
 │   ├── RetraceKit/               # Read-only SDK boundary over recording data (Phase 2 harness foundation)
 │   │   ├── CLIError.swift        # Shared CLI/SDK error contract (code, safe message, exit code, gate codes)
@@ -248,7 +242,6 @@ retrace/
 | **APP**        | `App/`        | —                      | Coordinator, DI container, data adapter, lifecycle management      |
 | **CLI**        | `Sources/RetraceCLI/` | root guide       | Read-only evidence, bounded inventory, gated encrypted sync, snapshot/verify/restore, observational baseline sampling and independent metrics |
 | **KIT**        | `Sources/RetraceKit/` | root guide       | Read-only SDK boundary: strict-VFS source reads, frame evidence, frame windows/watcher, inventory, telemetry, own-state metrics; no CLI or harness concerns |
-| **ATTRIBUTION** | `Attribution/` | root guide       | Realtime project classification harness: progressive blocks, Gemini client, own-state store; depends only on RetraceKit + Storage |
 | **UI**         | `UI/`         | `UI/AGENTS.md`         | SwiftUI interface (timeline, dashboard, settings, search)          |
 
 **Rule**: Each agent should **ONLY** modify files in their assigned module directory. Cross-module changes require explicit coordination.

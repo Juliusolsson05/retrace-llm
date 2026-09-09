@@ -270,29 +270,17 @@ let package = Package(
             dependencies: ["Shared", "Database", "Storage", .product(name: "SQLCipher", package: "swift-sqlcipher")],
             path: "Sources/RetraceKit"
         ),
-        .target(
-            name: "Attribution",
-            dependencies: ["RetraceKit", "Storage"],
-            path: "Attribution",
-            exclude: ["Tests"]
-        ),
         .executableTarget(
             name: "RetraceCLI",
-            dependencies: ["RetraceKit", "Attribution", "Shared", "Database", "Storage", .product(name: "SQLCipher", package: "swift-sqlcipher")],
+            dependencies: ["RetraceKit", "Shared", "Database", "Storage", .product(name: "SQLCipher", package: "swift-sqlcipher")],
             path: "Sources/RetraceCLI",
             exclude: ["Tests"]
         ),
         .testTarget(
             name: "RetraceCLITests",
-            dependencies: ["RetraceCLI", "RetraceKit", "Attribution", "Database", "Shared", "Storage", .product(name: "SQLCipher", package: "swift-sqlcipher")],
+            dependencies: ["RetraceCLI", "RetraceKit", "Database", "Shared", "Storage", .product(name: "SQLCipher", package: "swift-sqlcipher")],
             path: "Sources/RetraceCLI/Tests"
         ),
-        .testTarget(
-            name: "AttributionTests",
-            dependencies: ["Attribution", "RetraceKit", "Database", .product(name: "SQLCipher", package: "swift-sqlcipher")],
-            path: "Attribution/Tests"
-        ),
-
         // MARK: - Test executable for getMostRecentFrameTimestamp
         .executableTarget(
             name: "TestMostRecentFrame",
