@@ -1,5 +1,6 @@
 import Foundation
 import RetraceKit
+import Attribution
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
@@ -104,6 +105,9 @@ enum CLICommand {
         "swift run retrace-cli baseline --session SECONDS [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli baseline --harvest-log [PATH] [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli frame --frame-id N [--png PATH] [--storage-root PATH] [--state-root PATH]",
+        "swift run retrace-cli classify --live [--storage-root PATH] [--state-root PATH]",
+        "swift run retrace-cli now [--storage-root PATH] [--state-root PATH]",
+        "swift run retrace-cli report [--day YYYY-MM-DD] [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli sync --dry-run [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli sync --apply --phrase-from-stdin [--snapshot-current PATH] [--storage-root PATH] [--state-root PATH]",
         "swift run retrace-cli sync-plan --purge-day YYYY-MM-DD [--storage-root PATH] [--state-root PATH]",
@@ -138,6 +142,7 @@ enum CLICommand {
         "Baseline --session SECONDS (1...3600) samples the running Retrace process on a 1s cadence (proc_pidinfo CPU as percent of one core, phys_footprint bytes), tails ~/Library/Logs/Retrace/retrace.log with rotation awareness, and reports the canonical chunk byte delta between the start and end scans. If Retrace is not running, process fields are null with processFound=false; sampling disappearance is evidence, never a failure. CPU percent of one core can exceed 100 with multiple busy threads.",
         "Baseline --harvest-log [PATH] parses an existing log offline (default ~/Library/Logs/Retrace/retrace.log; a missing default reports logPresent=false, a missing explicit PATH exits 3 log_unreadable). Harvested shapes mirror the production emit sites: [Queue-DIAG] Worker COMPLETED durations, [PERF] p50/p95 summaries and slow samples, and Deduplication analysis outcomes with a decile similarity histogram (n/a similarities count toward outcomes only). Lines carrying one of those markers but failing the real emit format count as malformedMetricLines and are skipped. Percentiles are nearest-rank like the app's LatencyRecorder; absent evidence encodes as JSON null, not zero.",
         "Frame returns single-frame evidence INCLUDING OCR text and geometry — this is the inspection command, unlike export which is metadata-only by privacy design. Output: frameId, timestampMs, textAvailable (FTS ingestion can lag processing), video {videoId, videoFrameIndex, chunkKey, frameRate}, segment lineage with appName derived as export's bundle-ID suffix, and ocrRegions ordered by nodeOrder with text sliced exactly like the app's NodeQueries (SUBSTR over searchRanking_content c0||c1 via doc_segment; encrypted regions return same-length spaces and count in encryptedRegionCount). --png PATH additionally decodes the frame from its HEVC chunk read-only via the Storage extractor and writes a PNG that must live OUTSIDE the source storage root; decode failures exit 3 image_unavailable. All reads use the strict read-only source VFS; nothing in the source tree is modified.",
+        "Attribution commands run the realtime project classifier progressively: no day dump, blocks classify as work changes. classify --live watches new frames through RetraceKit (read-only, WAL-safe), closes a block on app/window switch, capture gap or max span, enriches it with recent OCR text and ≤768px JPEGs of its boundary frames, and asks Gemini Flash-Lite (GEMINI_API_KEY env, never stored; model override RETRACE_LLM_MODEL is a later option) for {project, activity, confidence}, storing the result in independent attribution state (default ~/Library/Application Support/RetraceAttribution). A per-frame checkpoint makes restarts resume exactly; classification failures are logged and skipped, never fatal. now reports the latest classified block and today's per-project totals; report --day lists blocks and totals. Recorder data stays read-only; the harness never writes inside the storage root.",
         "Baseline file bytes are logical sizes, not allocated disk space. Month is the validated calendar directory label, not a timestamp or timezone inference. Files may be orphaned or unfinished; baseline performs no decoding, hashing or DB-to-file reconciliation. File counts do not equal frame counts; many frames share a video.",
         "Inventory is bounded to 100000 entries and 10 seconds between metadata operations. A filesystem call itself may take longer. A limit or I/O error returns partial counts and exit 4. Missing chunks is empty only when the database has no video rows.",
         "Live results are observational, not an atomic database/filesystem snapshot. Elapsed time measures this command only, not OCR, compression or a performance improvement.",
@@ -172,8 +177,84 @@ enum CLICommand {
                 return await executeBaselineSampling(arguments: Array(arguments.dropFirst()))
             }
             if arguments.first == "frame" { return await executeFrame(arguments: Array(arguments.dropFirst())) }
+            if let command = arguments.first, ["classify", "now", "report"].contains(command) {
+                return await executeAttribution(command: command, arguments: Array(arguments.dropFirst()))
+            }
             return execute(arguments: arguments)
         }.value
+    }
+
+    private static func executeAttribution(command: String, arguments: [String]) async -> CLIResult {
+        let started = ProcessInfo.processInfo.systemUptime
+        var report: [String: Any?] = [
+            "schemaVersion": 1, "command": command, "status": "complete",
+            "exitCode": Int32(0), "elapsedMs": 0.0,
+        ]
+        var exitCode: Int32 = 0
+        var reportError: CLIError?
+        do {
+            let options = try parseOptions(arguments, attributionCommand: command)
+            let root = try localPath(options["--storage-root"] ?? AppPaths.storageRoot).resolvingSymlinksInPath()
+            // Attribution state is deliberately independent from CLI sync state.
+            let state = try localPath(options["--state-root"] ?? "~/Library/Application Support/RetraceAttribution")
+            if command == "classify" {
+                guard options["--live"] != nil else { throw usage() }
+                guard let apiKey = ProcessInfo.processInfo.environment["GEMINI_API_KEY"], !apiKey.isEmpty else {
+                    throw CLIError("llm_key_missing", "Export GEMINI_API_KEY before running the realtime classifier (BYO key; it is never stored).", exitCode: 3)
+                }
+                try await LiveClassifier.run(storageRoot: root, stateRoot: state, config: .init(apiKey: apiKey)) { line in
+                    FileHandle.standardError.write(Data(("retrace: \(line)\n").utf8))
+                }
+                report["note"] = "classifier stopped; checkpoint persisted"
+            } else if command == "now" {
+                let store = try AttributionStore(stateRoot: state, sourceRoot: root)
+                let dayStart = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970 * 1000
+                let blocks = try store.blocks(sinceMs: Int64(dayStart))
+                report["latestBlock"] = blocks.last.map { b in
+                    ["project": b.project, "activity": b.activity, "startedAtMs": b.startedAtMs,
+                     "endedAtMs": b.endedAtMs, "confidence": b.confidence, "app": b.appBundleId ?? NSNull()] as [String: Any?]
+                } ?? NSNull()
+                report["todayMsByProject"] = try store.totals(sinceMs: Int64(dayStart))
+                report["blockCount"] = blocks.count
+            } else {
+                let store = try AttributionStore(stateRoot: state, sourceRoot: root)
+                let day: Date
+                if let label = options["--day"] { day = try parseDay(label) } else { day = Date() }
+                let dayStart = Int64(Calendar.current.startOfDay(for: day).timeIntervalSince1970 * 1000)
+                let dayEnd = dayStart + 86_400_000
+                let blocks = try store.blocks(sinceMs: dayStart).filter { $0.endedAtMs <= dayEnd }
+                report["day"] = dayString(day)
+                report["msByProject"] = blocks.reduce(into: [String: Int64]()) { totals, b in
+                    totals[b.project, default: 0] += b.durationMs
+                }
+                report["blocks"] = blocks.map { b in
+                    ["id": b.id, "project": b.project, "activity": b.activity, "startedAtMs": b.startedAtMs,
+                     "endedAtMs": b.endedAtMs, "app": b.appBundleId ?? NSNull(), "window": b.windowName ?? NSNull()] as [String: Any?]
+                }
+            }
+        } catch {
+            let failure = error as? CLIError ?? CLIError("attribution_unavailable", "Attribution command failed.", exitCode: 3)
+            report["status"] = "failed"
+            exitCode = failure.exitCode
+            reportError = failure
+        }
+        report["exitCode"] = exitCode
+        report["elapsedMs"] = max(0, (ProcessInfo.processInfo.systemUptime - started) * 1000)
+        report["error"] = reportError.map { ["code": $0.code, "message": $0.message] as [String: String] }
+        do {
+            let value = try JSONSerialization.data(withJSONObject: report.compactMapValues { $0 ?? NSNull() })
+            var bytes = value
+            bytes.append(0x0A)
+            return CLIResult(stdout: bytes, stderr: reportError.map { "retrace-cli: \($0.code): \($0.message)\n" } ?? "", exitCode: exitCode)
+        } catch {
+            return CLIResult(stdout: Data("{\"schemaVersion\":1,\"status\":\"failed\",\"exitCode\":5}\n".utf8),
+                             stderr: "retrace-cli: output_failed: JSON encoding failed.\n", exitCode: 5)
+        }
+    }
+
+    private static func dayString(_ date: Date) -> String {
+        let components = Calendar.current.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
     }
 
     private static func executeFrame(arguments: [String]) async -> CLIResult {
@@ -697,7 +778,8 @@ enum CLICommand {
 
     static func parseOptions(_ arguments: [String], export: Bool = false, sync: Bool = false,
                              snapshotCommand: String? = nil, purgeCommand: String? = nil, keyCommand: String? = nil,
-                             baselineCommand: Bool = false, frameCommand: Bool = false) throws -> [String: String] {
+                             baselineCommand: Bool = false, frameCommand: Bool = false,
+                             attributionCommand: String? = nil) throws -> [String: String] {
         var allowed = ["--storage-root", "--state-root"]
         if export { allowed += ["--day", "--limit"] }
         if sync { allowed.append("--snapshot-current") }
@@ -707,10 +789,16 @@ enum CLICommand {
         if purgeCommand == "purge-apply" { allowed.append("--day") }
         if baselineCommand { allowed.append("--session") }
         if frameCommand { allowed += ["--frame-id", "--png"] }
+        if attributionCommand == "report" { allowed.append("--day") }
         var values: [String: String] = [:]
         var index = 0
         while index < arguments.count {
             let option = arguments[index]
+            if attributionCommand == "classify", option == "--live", values[option] == nil {
+                values[option] = "true"
+                index += 1
+                continue
+            }
             // --harvest-log may stand alone (default log) or take an explicit path.
             if baselineCommand, option == "--harvest-log", values[option] == nil {
                 if index + 1 < arguments.count, !arguments[index + 1].hasPrefix("--") {

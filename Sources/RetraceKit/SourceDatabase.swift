@@ -242,6 +242,93 @@ public enum SourceDatabase {
         }
     }
 
+    /// Lightweight frame record for realtime consumers: identity, timing, lineage.
+    public struct FrameSummary: Sendable, Equatable {
+        public let frameId: Int64
+        public let timestampMs: Int64
+        public let videoId: Int64?
+        public let videoFrameIndex: Int?
+        public let appBundleId: String?
+        public let windowName: String?
+        public let browserUrl: String?
+    }
+
+    /// Frames in a timestamp window (sinceMs exclusive, untilMs inclusive), ordered by
+    /// capture time then id. Realtime attribution reads everything the recorder saw —
+    /// unlike export, hidden-segment filtering is intentionally not applied.
+    public static func frames(_ connection: DatabaseConnection, sinceMs: Int64?, untilMs: Int64?, limit: Int) throws -> [FrameSummary] {
+        try statement(connection, """
+            SELECT f.id, f.createdAt, f.videoId, f.videoFrameIndex, NULLIF(s.bundleID, ''), s.windowName, s.browserUrl
+            FROM frame f LEFT JOIN segment s ON s.id = f.segmentId
+            WHERE (? IS NULL OR f.createdAt > ?) AND (? IS NULL OR f.createdAt <= ?)
+            ORDER BY f.createdAt, f.id
+            LIMIT ?
+            """) { stmt in
+            guard Self.bindOptionalInt64(stmt, 1, sinceMs) == SQLITE_OK,
+                  Self.bindOptionalInt64(stmt, 2, sinceMs) == SQLITE_OK,
+                  Self.bindOptionalInt64(stmt, 3, untilMs) == SQLITE_OK,
+                  Self.bindOptionalInt64(stmt, 4, untilMs) == SQLITE_OK,
+                  sqlite3_bind_int(stmt, 5, Int32(limit)) == SQLITE_OK else {
+                throw CLIError("database_query_failed", "Could not bind frame window parameters.")
+            }
+            return try Self.stepFrameSummaries(stmt)
+        }
+    }
+
+    /// Binds a genuine SQL NULL for nil bounds so `(? IS NULL OR ...)` gates work
+    /// for both the lower and the upper edge (a numeric sentinel silently breaks <=).
+    private static func bindOptionalInt64(_ stmt: OpaquePointer, _ index: Int32, _ value: Int64?) -> Int32 {
+        value.map { sqlite3_bind_int64(stmt, index, $0) } ?? sqlite3_bind_null(stmt, index)
+    }
+
+    /// Frames with id strictly greater than `sinceFrameId` — the watcher/resume shape.
+    public static func frames(_ connection: DatabaseConnection, sinceFrameId: Int64, limit: Int) throws -> [FrameSummary] {
+        try statement(connection, """
+            SELECT f.id, f.createdAt, f.videoId, f.videoFrameIndex, NULLIF(s.bundleID, ''), s.windowName, s.browserUrl
+            FROM frame f LEFT JOIN segment s ON s.id = f.segmentId
+            WHERE f.id > ?
+            ORDER BY f.id
+            LIMIT ?
+            """) { stmt in
+            guard sqlite3_bind_int64(stmt, 1, sinceFrameId) == SQLITE_OK,
+                  sqlite3_bind_int(stmt, 2, Int32(limit)) == SQLITE_OK else {
+                throw CLIError("database_query_failed", "Could not bind frame cursor parameters.")
+            }
+            return try Self.stepFrameSummaries(stmt)
+        }
+    }
+
+    public static func latestFrameId(_ connection: DatabaseConnection) throws -> Int64 {
+        try statement(connection, "SELECT COALESCE(MAX(id), 0) FROM frame") { stmt in
+            guard sqlite3_step(stmt) == SQLITE_ROW else { throw CLIError("database_query_failed", "Frame cursor SELECT failed.") }
+            return sqlite3_column_int64(stmt, 0)
+        }
+    }
+
+    private static func stepFrameSummaries(_ stmt: OpaquePointer) throws -> [FrameSummary] {
+        func text(_ column: Int32) -> String? {
+            guard let value = sqlite3_column_text(stmt, column) else { return nil }
+            return String(decoding: UnsafeBufferPointer(start: value, count: Int(sqlite3_column_bytes(stmt, column))), as: UTF8.self)
+        }
+        var frames: [FrameSummary] = []
+        var result = sqlite3_step(stmt)
+        while result == SQLITE_ROW {
+            guard sqlite3_column_type(stmt, 0) == SQLITE_INTEGER, sqlite3_column_type(stmt, 1) == SQLITE_INTEGER else {
+                throw CLIError("database_query_failed", "Frame window contains invalid native numeric metadata.")
+            }
+            frames.append(FrameSummary(
+                frameId: sqlite3_column_int64(stmt, 0),
+                timestampMs: sqlite3_column_int64(stmt, 1),
+                videoId: sqlite3_column_type(stmt, 2) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 2),
+                videoFrameIndex: sqlite3_column_type(stmt, 3) == SQLITE_NULL ? nil : Int(sqlite3_column_int64(stmt, 3)),
+                appBundleId: text(4), windowName: text(5), browserUrl: text(6)
+            ))
+            result = sqlite3_step(stmt)
+        }
+        guard result == SQLITE_DONE else { throw CLIError("database_query_failed", "Frame window SELECT did not complete.") }
+        return frames
+    }
+
     public static func aggregate(_ connection: DatabaseConnection) throws -> DatabaseSummary {
         // One statement gives internally consistent counts/coverage at SQLite's read snapshot.
         try statement(connection, """
