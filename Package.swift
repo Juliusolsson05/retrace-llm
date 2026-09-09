@@ -22,6 +22,7 @@ let package = Package(
         .library(name: "Shared", targets: ["Shared"]),
         .library(name: "Database", targets: ["Database"]),
         .library(name: "Storage", targets: ["Storage"]),
+        .library(name: "RetraceKit", targets: ["RetraceKit"]),
         .library(name: "Capture", targets: ["Capture"]),
         .library(name: "Processing", targets: ["Processing"]),
         .library(name: "Search", targets: ["Search"]),
