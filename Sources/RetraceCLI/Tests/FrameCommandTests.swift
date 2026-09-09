@@ -4,6 +4,7 @@ import SQLCipher
 import Shared
 import Storage
 @testable import Database
+@testable import RetraceKit
 @testable import RetraceCLI
 
 /// Single-frame evidence access. Text slicing mirrors the app's canonical read

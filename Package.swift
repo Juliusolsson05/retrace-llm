@@ -265,15 +265,20 @@ let package = Package(
         ),
 
         // MARK: - Read-only metadata CLI (no application bootstrap)
+        .target(
+            name: "RetraceKit",
+            dependencies: ["Shared", "Database", "Storage", .product(name: "SQLCipher", package: "swift-sqlcipher")],
+            path: "Sources/RetraceKit"
+        ),
         .executableTarget(
             name: "RetraceCLI",
-            dependencies: ["Shared", "Database", "Storage", .product(name: "SQLCipher", package: "swift-sqlcipher")],
+            dependencies: ["RetraceKit", "Shared", "Database", "Storage", .product(name: "SQLCipher", package: "swift-sqlcipher")],
             path: "Sources/RetraceCLI",
             exclude: ["Tests"]
         ),
         .testTarget(
             name: "RetraceCLITests",
-            dependencies: ["RetraceCLI", "Database", "Shared", "Storage", .product(name: "SQLCipher", package: "swift-sqlcipher")],
+            dependencies: ["RetraceCLI", "RetraceKit", "Database", "Shared", "Storage", .product(name: "SQLCipher", package: "swift-sqlcipher")],
             path: "Sources/RetraceCLI/Tests"
         ),
 

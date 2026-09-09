@@ -3,18 +3,18 @@ import Database
 import Shared
 import SQLCipher
 
-struct DatabaseSummary: Encodable, Sendable {
-    let frameCount: Int64
-    let videoCount: Int64
-    let nodeCount: Int64
-    let firstFrameTimestampMs: Int64?
-    let lastFrameTimestampMs: Int64?
+public struct DatabaseSummary: Encodable, Sendable {
+    public let frameCount: Int64
+    public let videoCount: Int64
+    public let nodeCount: Int64
+    public let firstFrameTimestampMs: Int64?
+    public let lastFrameTimestampMs: Int64?
 
     private enum CodingKeys: String, CodingKey {
         case frameCount, videoCount, nodeCount, firstFrameTimestampMs, lastFrameTimestampMs
     }
 
-    func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(frameCount, forKey: .frameCount)
         try container.encode(videoCount, forKey: .videoCount)
@@ -27,22 +27,22 @@ struct DatabaseSummary: Encodable, Sendable {
 
 /// Versioned JSONL wire record. Native rows can precede video assignment, so preserve
 /// missing video references as null instead of inventing a usable frame location.
-struct CLIExportFrame: Encodable, Sendable {
-    let frameId: Int64
-    let timestampMs: Int64
-    let videoId: Int64?
-    let videoFrameIndex: Int64?
-    let segmentId: Int64
-    let appBundleId: String?
-    let windowName: String?
-    let browserUrl: String?
+public struct CLIExportFrame: Encodable, Sendable {
+    public let frameId: Int64
+    public let timestampMs: Int64
+    public let videoId: Int64?
+    public let videoFrameIndex: Int64?
+    public let segmentId: Int64
+    public let appBundleId: String?
+    public let windowName: String?
+    public let browserUrl: String?
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, frameId, timestampMs, videoId, videoFrameIndex, segmentId
         case appBundleId, appName, windowName, browserUrl
     }
 
-    func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(1, forKey: .schemaVersion)
         try container.encode(frameId, forKey: .frameId)
@@ -59,8 +59,8 @@ struct CLIExportFrame: Encodable, Sendable {
     }
 }
 
-enum SourceDatabase {
-    static func withConnection<T>(root: URL, allowMissingVideoPath: Bool = false, _ body: (DatabaseConnection) throws -> T) throws -> T {
+public enum SourceDatabase {
+    public static func withConnection<T>(root: URL, allowMissingVideoPath: Bool = false, _ body: (DatabaseConnection) throws -> T) throws -> T {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory) else {
             throw CLIError("storage_root_missing", "Storage root does not exist. Pass --storage-root PATH to an existing Retrace storage directory.")
@@ -143,38 +143,38 @@ enum SourceDatabase {
         CLIError("unsupported_schema", "Required native schema is missing or incompatible (schema_migrations, segment, frame, video, node); no migrations were run.")
     }
 
-    struct FrameOCRRegion: Sendable {
-        let nodeOrder: Int
-        let text: String
-        let leftX: Double
-        let topY: Double
-        let width: Double
-        let height: Double
-        let windowIndex: Int?
+    public struct FrameOCRRegion: Sendable {
+        public let nodeOrder: Int
+        public let text: String
+        public let leftX: Double
+        public let topY: Double
+        public let width: Double
+        public let height: Double
+        public let windowIndex: Int?
     }
 
-    struct FrameVideoInfo: Sendable {
-        let videoId: Int64
-        let videoFrameIndex: Int?
-        let chunkKey: String
-        let frameRate: Double?
+    public struct FrameVideoInfo: Sendable {
+        public let videoId: Int64
+        public let videoFrameIndex: Int?
+        public let chunkKey: String
+        public let frameRate: Double?
     }
 
-    struct FrameSegmentInfo: Sendable {
-        let segmentId: Int64
-        let appBundleId: String?
-        let windowName: String?
-        let browserUrl: String?
+    public struct FrameSegmentInfo: Sendable {
+        public let segmentId: Int64
+        public let appBundleId: String?
+        public let windowName: String?
+        public let browserUrl: String?
     }
 
-    struct FrameEvidence: Sendable {
-        let frameId: Int64
-        let timestampMs: Int64
-        let textAvailable: Bool
-        let video: FrameVideoInfo?
-        let segment: FrameSegmentInfo?
-        var regions: [FrameOCRRegion] = []
-        var encryptedRegionCount = 0
+    public struct FrameEvidence: Sendable {
+        public let frameId: Int64
+        public let timestampMs: Int64
+        public let textAvailable: Bool
+        public let video: FrameVideoInfo?
+        public let segment: FrameSegmentInfo?
+        public var regions: [FrameOCRRegion] = []
+        public var encryptedRegionCount = 0
     }
 
     /// Single-frame evidence: lineage plus OCR regions. Text slicing mirrors the app's
@@ -182,7 +182,7 @@ enum SourceDatabase {
     /// text blob is searchRanking_content c0||c1 reached via doc_segment, each node
     /// slices SUBSTR(blob, textOffset + 1, textLength), and encrypted nodes yield the
     /// same-length space placeholder instead of their ciphertext.
-    static func frameEvidence(_ connection: DatabaseConnection, frameId: Int64) throws -> FrameEvidence? {
+    public static func frameEvidence(_ connection: DatabaseConnection, frameId: Int64) throws -> FrameEvidence? {
         try statement(connection, """
             SELECT f.id, f.createdAt, f.videoFrameIndex,
                    v.id, v.path, v.frameRate,
@@ -242,7 +242,7 @@ enum SourceDatabase {
         }
     }
 
-    static func aggregate(_ connection: DatabaseConnection) throws -> DatabaseSummary {
+    public static func aggregate(_ connection: DatabaseConnection) throws -> DatabaseSummary {
         // One statement gives internally consistent counts/coverage at SQLite's read snapshot.
         try statement(connection, """
             SELECT COUNT(*), (SELECT COUNT(*) FROM video), (SELECT COUNT(*) FROM node),
@@ -264,7 +264,7 @@ enum SourceDatabase {
     /// Streams at most limit rows and returns whether another visible row exists.
     /// visibleFrameIDs is intentionally unbounded; reuse its visibility helpers and
     /// strict day predicates here so the CLI never materializes an entire day's IDs.
-    static func exportFrames(
+    public static func exportFrames(
         _ connection: DatabaseConnection,
         config: DatabaseConfig,
         day: Date,
@@ -303,14 +303,14 @@ enum SourceDatabase {
         }
     }
 
-    struct PurgeEvidence: Sendable {
-        let frameCount: Int
-        let keys: [String]
+    public struct PurgeEvidence: Sendable {
+        public let frameCount: Int
+        public let keys: [String]
     }
 
     /// Read only bounded metadata, never OCR or files. A lookahead beyond the bound
     /// fails the entire command before any deletion intent is committed.
-    static func purgeEvidence(_ connection: DatabaseConnection, config: DatabaseConfig, day: Date,
+    public static func purgeEvidence(_ connection: DatabaseConnection, config: DatabaseConfig, day: Date,
                               limit: Int = 50_000) throws -> PurgeEvidence {
         var columns: Set<String> = []
         try statement(connection, "SELECT name FROM pragma_table_info('video')") { stmt in
@@ -449,8 +449,8 @@ enum SourceDatabase {
     }
 }
 
-enum ReadOnlySourceVFS {
-    static let name = "retrace-cli-readonly"
+public enum ReadOnlySourceVFS {
+    public static let name = "retrace-cli-readonly"
     private static let methodsOffset: Int = {
         let size = Int(sqlite3_vfs_find(nil)!.pointee.szOsFile)
         let alignment = MemoryLayout<UnsafePointer<sqlite3_io_methods>>.alignment
@@ -464,7 +464,7 @@ enum ReadOnlySourceVFS {
     // This process-lifetime, nondefault VFS denies creation/deletion and forces read-only
     // file opens. readonly_shm=1 separately prevents writes through shared-memory mapping.
     // A missing WAL therefore fails, instead of writing a sidecar or ignoring live WAL.
-    static let registration: Int32 = {
+    public static let registration: Int32 = {
         guard let base = sqlite3_vfs_find(nil) else { return SQLITE_ERROR }
         let wrapper = UnsafeMutablePointer<sqlite3_vfs>.allocate(capacity: 1)
         wrapper.initialize(to: base.pointee)

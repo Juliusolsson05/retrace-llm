@@ -5,6 +5,7 @@ import SQLCipher
 import Shared
 import Storage
 @testable import Database
+@testable import RetraceKit
 @testable import RetraceCLI
 
 /// SQLite rows below exercise database mechanics, not recording quality or performance.

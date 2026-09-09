@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+@testable import RetraceKit
 @testable import RetraceCLI
 
 /// Fixtures quote the production emit sites verbatim so the parser tracks real formats:

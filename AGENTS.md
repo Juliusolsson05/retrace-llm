@@ -59,18 +59,20 @@ retrace/
 │   └── decomposition/           # Staged decomposition docs for large features
 ├── Package.swift                # Swift Package Manager configuration
 ├── Sources/
-│   ├── RetraceCLI/              # Evidence, gated encrypted sync and database recovery executable `retrace-cli`
-│   │   ├── RetraceCLI.swift     # Noninteractive entry point
-│   │   ├── CLICommand.swift     # JSON/JSONL contracts, metrics, evidence/sync/purge/snapshot/verify/restore/frame/baseline routing
-│   │   ├── CLIKeyCommand.swift  # Explicit key init/status/rotate/unwrap, stdin recovery and secret-free metrics
-│   │   ├── SourceDatabase.swift # Native schema/aggregate/visible-day purge/frame-evidence SELECTs, strict read-only source VFS
-│   │   ├── ChunkInventory.swift # Bounded descriptor-relative metadata inventory
-│   │   ├── CLIStateMetrics.swift # Independent CLI-owned daily_metrics SQLite store
-│   │   ├── B2Client.swift       # Disabled-by-default B2 Native API with injectable transport and authorization URL
-│   │   ├── SyncPlanner.swift    # Read-only chunk hashing/revision planning and pending-purge suppression
-│   │   ├── SyncEngine.swift     # Gated encrypted apply, current snapshot lineage, durable upload/deletion retries
-│   │   ├── SnapshotStore.swift  # SQLite online backup, optional RBC1 encryption, dual-hash lineage and empty-target restore
-│   │   ├── BaselineSampler.swift # Real-session process/log sampling and offline log harvesting for baseline reports
+│   ├── RetraceKit/               # Read-only SDK boundary over recording data (Phase 2 harness foundation)
+│   │   ├── CLIError.swift        # Shared CLI/SDK error contract (code, safe message, exit code, gate codes)
+│   │   ├── SourceDatabase.swift  # Native schema/aggregate/visible-day purge/frame-evidence SELECTs, strict read-only source VFS
+│   │   ├── ChunkInventory.swift  # Bounded descriptor-relative metadata inventory
+│   │   ├── CLIStateMetrics.swift # Independent CLI-owned daily_metrics SQLite store (own-state-root pattern)
+│   │   └── BaselineSampler.swift # Real-session process/log sampling and offline log harvesting for baseline reports
+│   ├── RetraceCLI/               # Evidence, gated encrypted sync and database recovery executable `retrace-cli`
+│   │   ├── RetraceCLI.swift      # Noninteractive entry point
+│   │   ├── CLICommand.swift      # JSON/JSONL contracts, metrics, evidence/sync/purge/snapshot/verify/restore/frame/baseline routing
+│   │   ├── CLIKeyCommand.swift   # Explicit key init/status/rotate/unwrap, stdin recovery and secret-free metrics
+│   │   ├── B2Client.swift        # Disabled-by-default B2 Native API with injectable transport and authorization URL
+│   │   ├── SyncPlanner.swift     # Read-only chunk hashing/revision planning and pending-purge suppression
+│   │   ├── SyncEngine.swift      # Gated encrypted apply, current snapshot lineage, durable upload/deletion retries
+│   │   ├── SnapshotStore.swift   # SQLite online backup, optional RBC1 encryption, dual-hash lineage and empty-target restore
 │   │   └── Tests/
 │   │       ├── RetraceCLITests.swift # SQLite/FileManager fixtures and offline B2 upload/verify/restore cycles
 │   │       ├── BaselineSamplerTests.swift # Real-emit-format log fixtures, session self-sampling and CLI mode routing
@@ -237,6 +239,7 @@ retrace/
 | **MIGRATION**  | `Migration/`  | `Migration/AGENTS.md`  | Import from Rewind AI (Rewind only, others planned)                |
 | **APP**        | `App/`        | —                      | Coordinator, DI container, data adapter, lifecycle management      |
 | **CLI**        | `Sources/RetraceCLI/` | root guide       | Read-only evidence, bounded inventory, gated encrypted sync, snapshot/verify/restore, observational baseline sampling and independent metrics |
+| **KIT**        | `Sources/RetraceKit/` | root guide       | Read-only SDK boundary: strict-VFS source reads, frame evidence, inventory, telemetry, own-state metrics; no CLI or harness concerns |
 | **UI**         | `UI/`         | `UI/AGENTS.md`         | SwiftUI interface (timeline, dashboard, settings, search)          |
 
 **Rule**: Each agent should **ONLY** modify files in their assigned module directory. Cross-module changes require explicit coordination.

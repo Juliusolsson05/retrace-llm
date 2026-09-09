@@ -8,8 +8,9 @@ import Glibc
 /// Aggregated metrics parsed from retrace.log lines. Every recognized shape is quoted
 /// from its production emit site in BaselineSamplerTests.swift so format drift fails
 /// tests instead of silently miscounting.
-struct HarvestedLogMetrics: Sendable {
-    struct LatencySummary: Sendable, Equatable {
+public struct HarvestedLogMetrics: Sendable {
+    public init() {}
+    public struct LatencySummary: Sendable, Equatable {
         var sampleCount = 0
         var totalCount = 0
         var latestMs = 0.0
@@ -18,22 +19,22 @@ struct HarvestedLogMetrics: Sendable {
         var maxMs = 0.0
     }
 
-    var ocrCompletedCount = 0
-    var ocrDurationSamplesMs: [Double] = []
-    var dedupKeptCount = 0
-    var dedupDroppedCount = 0
-    var similaritySamplesPercent: [Double] = []
-    var latencySummaries: [String: LatencySummary] = [:]
-    var slowSampleCounts: [String: Int] = [:]
-    var malformedMetricLines = 0
-    var linesRead = 0
+    public var ocrCompletedCount = 0
+    public var ocrDurationSamplesMs: [Double] = []
+    public var dedupKeptCount = 0
+    public var dedupDroppedCount = 0
+    public var similaritySamplesPercent: [Double] = []
+    public var latencySummaries: [String: LatencySummary] = [:]
+    public var slowSampleCounts: [String: Int] = [:]
+    public var malformedMetricLines = 0
+    public var linesRead = 0
 
-    static let similarityBucketLabels = [
+    public static let similarityBucketLabels = [
         "0-9%", "10-19%", "20-29%", "30-39%", "40-49%",
         "50-59%", "60-69%", "70-79%", "80-89%", "90-100%",
     ]
 
-    var similarityHistogram: [String: Int] {
+    public var similarityHistogram: [String: Int] {
         var buckets: [String: Int] = [:]
         for percent in similaritySamplesPercent {
             let index = max(0, min(9, Int(percent / 10)))
@@ -58,7 +59,7 @@ struct HarvestedLogMetrics: Sendable {
 /// Pure parsing plus file/tail reading for baseline log harvesting. All line shapes
 /// mirror real emit sites; lines carrying a metric marker that fail their pattern are
 /// counted as malformed rather than guessed at.
-enum BaselineLogHarvester {
+public enum BaselineLogHarvester {
     // Processing/FrameProcessingQueue.swift:1156
     private static let queueCompleted = #/\[Queue-DIAG\] Worker (\d+) COMPLETED frame (\S+) in (\d+(?:\.\d+)?)s/#
     // Shared/Logging.swift:266
@@ -70,7 +71,7 @@ enum BaselineLogHarvester {
     // appends % to real numbers.
     private static let deduplication = #/Deduplication analysis \(trigger: (\S+), similarity: (\d+(?:\.\d+)?%|n\/a), threshold: (\d+(?:\.\d+)?%|disabled), keepBySimilarity: (n\/a|true|false), keepByMouseMovement: (true|false), outcome: (kept|deduplicated)\)/#
 
-    static func harvest(url: URL) throws -> HarvestedLogMetrics {
+public     static func harvest(url: URL) throws -> HarvestedLogMetrics {
         var metrics = HarvestedLogMetrics()
         var streamer = try LineStreamer(url: url)
         while let line = try streamer.next() {
@@ -123,7 +124,7 @@ enum BaselineLogHarvester {
     /// Nearest-rank percentile on ascending samples, mirroring the app's own
     /// LatencyRecorder (Shared/Logging.swift:373). Nil for an empty sample set so the
     /// report can distinguish "no evidence" from a fabricated zero.
-    static func percentile(_ samples: [Double], p: Double) -> Double? {
+public     static func percentile(_ samples: [Double], p: Double) -> Double? {
         guard !samples.isEmpty else { return nil }
         let sorted = samples.sorted()
         let clamped = min(max(p, 0), 1)
@@ -175,9 +176,9 @@ private struct LineStreamer {
 
 /// One JSON report for both `baseline --session` and `baseline --harvest-log`. Nil
 /// fields encode as explicit JSON nulls, never as invented zeros.
-struct BaselineReport: Encodable {
-    struct DedupCounts: Encodable { var kept: Int; var dropped: Int }
-    struct LatencySummaryLine: Encodable {
+public struct BaselineReport: Encodable {
+    public struct DedupCounts: Encodable { var kept: Int; var dropped: Int }
+    public struct LatencySummaryLine: Encodable {
         var metric: String
         var sampleCount: Int
         var totalCount: Int
@@ -187,35 +188,35 @@ struct BaselineReport: Encodable {
         var slowSampleCount: Int
     }
 
-    let schemaVersion = 1
-    let command = "baseline"
-    var status = "complete"
-    var exitCode: Int32 = 0
-    var elapsedMs = 0.0
-    var mode = "session"
-    var sampledSeconds: Int?
-    var logPresent = true
-    var processFound: Bool?
-    var processSampleCount = 0
+    public let schemaVersion = 1
+    public let command = "baseline"
+    public var status = "complete"
+    public var exitCode: Int32 = 0
+    public var elapsedMs = 0.0
+    public var mode = "session"
+    public var sampledSeconds: Int?
+    public var logPresent = true
+    public var processFound: Bool?
+    public var processSampleCount = 0
     /// Percent of a single core; can exceed 100 with multiple busy threads.
-    var cpuP50Percent: Double?
-    var cpuP95Percent: Double?
-    var memFootprintP50Bytes: Double?
-    var memFootprintP95Bytes: Double?
-    var memFootprintMaxBytes: Double?
-    var ocrCompletedCount = 0
-    var ocrDurationP50Ms: Double?
-    var ocrDurationP95Ms: Double?
-    var dedupKeptVsDropped = DedupCounts(kept: 0, dropped: 0)
-    var similarityHistogram: [String: Int] = [:]
-    var latencySummaries: [LatencySummaryLine] = []
-    var storageGrowthBytes: Int64?
-    var logLinesRead = 0
-    var malformedMetricLines = 0
-    let note = "observational"
-    var error: CLIError?
+    public var cpuP50Percent: Double?
+    public var cpuP95Percent: Double?
+    public var memFootprintP50Bytes: Double?
+    public var memFootprintP95Bytes: Double?
+    public var memFootprintMaxBytes: Double?
+    public var ocrCompletedCount = 0
+    public var ocrDurationP50Ms: Double?
+    public var ocrDurationP95Ms: Double?
+    public var dedupKeptVsDropped = DedupCounts(kept: 0, dropped: 0)
+    public var similarityHistogram: [String: Int] = [:]
+    public var latencySummaries: [LatencySummaryLine] = []
+    public var storageGrowthBytes: Int64?
+    public var logLinesRead = 0
+    public var malformedMetricLines = 0
+    public let note = "observational"
+    public var error: CLIError?
 
-    enum CodingKeys: String, CodingKey {
+    public enum CodingKeys: String, CodingKey {
         case schemaVersion, command, status, exitCode, elapsedMs, mode, sampledSeconds, logPresent
         case processFound, processSampleCount, cpuP50Percent, cpuP95Percent
         case memFootprintP50Bytes, memFootprintP95Bytes, memFootprintMaxBytes
@@ -224,7 +225,7 @@ struct BaselineReport: Encodable {
         case logLinesRead, malformedMetricLines, note, error
     }
 
-    func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(schemaVersion, forKey: .schemaVersion)
         try c.encode(command, forKey: .command)
@@ -258,7 +259,7 @@ struct BaselineReport: Encodable {
         if let value { try c.encode(value, forKey: key) } else { try c.encodeNil(forKey: key) }
     }
 
-    static func summarizing(mode: String, metrics: HarvestedLogMetrics) -> BaselineReport {
+    public static func summarizing(mode: String, metrics: HarvestedLogMetrics) -> BaselineReport {
         var report = BaselineReport()
         report.mode = mode
         report.ocrCompletedCount = metrics.ocrCompletedCount
@@ -281,22 +282,22 @@ struct BaselineReport: Encodable {
 /// tailing, and a canonical-chunk byte delta. The recorded app itself is out of scope;
 /// this only observes it. Process disappearance mid-session yields fewer samples, not
 /// an error, because the report is explicitly observational.
-enum BaselineSampler {
-    struct ProcessSample: Sendable {
+public enum BaselineSampler {
+    public struct ProcessSample: Sendable {
         let totalCPUSeconds: Double
         let physFootprintBytes: Double
     }
 
-    enum ProcessTarget: Sendable {
+    public enum ProcessTarget: Sendable {
         case pid(Int32)
         case retraceApp
     }
 
-    static let defaultLogURL = URL(fileURLWithPath: NSString(string: "~/Library/Logs/Retrace/retrace.log").expandingTildeInPath)
+    public static let defaultLogURL = URL(fileURLWithPath: NSString(string: "~/Library/Logs/Retrace/retrace.log").expandingTildeInPath)
     /// Shared/Logging.swift:438 rotates retrace.log to retrace.old.log.
-    static let defaultRotatedLogURL = URL(fileURLWithPath: NSString(string: "~/Library/Logs/Retrace/retrace.old.log").expandingTildeInPath)
+    public static let defaultRotatedLogURL = URL(fileURLWithPath: NSString(string: "~/Library/Logs/Retrace/retrace.old.log").expandingTildeInPath)
 
-    static func sampleProcess(pid: Int32) -> ProcessSample? {
+public     static func sampleProcess(pid: Int32) -> ProcessSample? {
         var info = proc_taskinfo()
         guard proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, Int32(MemoryLayout<proc_taskinfo>.size))
                 == Int32(MemoryLayout<proc_taskinfo>.size) else { return nil }
@@ -328,7 +329,7 @@ enum BaselineSampler {
 
     /// Lowest PID whose executable name matches, so a relaunched app is preferred over
     /// any stale duplicate. p_comm is truncated to 16 bytes by the kernel.
-    static func findProcessID(named name: String) -> Int32? {
+public     static func findProcessID(named name: String) -> Int32? {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
         var size = 0
         guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 0 else { return nil }
@@ -349,7 +350,7 @@ enum BaselineSampler {
         return found
     }
 
-    static func harvestOffline(logURL: URL, requireExists: Bool) -> BaselineReport {
+public     static func harvestOffline(logURL: URL, requireExists: Bool) -> BaselineReport {
         guard FileManager.default.fileExists(atPath: logURL.path) else {
             if requireExists {
                 var report = BaselineReport.summarizing(mode: "harvest-log", metrics: HarvestedLogMetrics())
@@ -378,7 +379,7 @@ enum BaselineSampler {
         }
     }
 
-    static func runSession(seconds: Int, storageRoot: URL, logURL: URL,
+public     static func runSession(seconds: Int, storageRoot: URL, logURL: URL,
                            rotatedLogURL: URL? = nil,
                            target: ProcessTarget = .retraceApp) async throws -> BaselineReport {
         let started = ProcessInfo.processInfo.systemUptime

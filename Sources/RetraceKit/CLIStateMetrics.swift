@@ -9,10 +9,10 @@ import Glibc
 
 /// Owned by a single command worker. No DatabaseManager, source connection, app migrations
 /// or defaults writes: this table exists solely in independent CLI state.
-final class CLIStateMetrics {
+public final class CLIStateMetrics {
     private let db: OpaquePointer
 
-    init(root: URL, sourceRoot: URL) throws {
+    public init(root: URL, sourceRoot: URL) throws {
         let state = root
         let source = try Self.canonicalPath(sourceRoot)
         let stateCanonical = try Self.canonicalPath(state)
@@ -70,7 +70,7 @@ final class CLIStateMetrics {
 
     deinit { sqlite3_close_v2(db) }
 
-    func record(command: String, outcome: String, durationMs: Double? = nil, errorCode: String? = nil,
+    public func record(command: String, outcome: String, durationMs: Double? = nil, errorCode: String? = nil,
                 truncated: Bool? = nil, bytesUploaded: Int64? = nil, objectsUploaded: Int? = nil,
                 deletes: Int? = nil, suppressedCount: Int? = nil) throws {
         struct Metadata: Encodable {
@@ -104,7 +104,7 @@ final class CLIStateMetrics {
         CLIError("unsafe_state_root", "CLI state must be outside source storage, with no symlink components or hardlinked metric files. Choose another --state-root.", exitCode: 2)
     }
 
-    static func canonicalPath(_ url: URL) throws -> String {
+    public static func canonicalPath(_ url: URL) throws -> String {
         var path = url.path
         var suffix: [String] = []
         // Resolve the existing ancestor even when the requested source/state is missing.

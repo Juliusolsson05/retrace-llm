@@ -5,35 +5,35 @@ import Darwin
 import Glibc
 #endif
 
-struct ChunkInventory: Encodable, Sendable {
-    struct Month: Encodable, Sendable {
+public struct ChunkInventory: Encodable, Sendable {
+    public struct Month: Encodable, Sendable {
         let month: String
         var fileCount: Int64 = 0
         var bytes: Int64 = 0
     }
 
-    var status = "complete"
-    var chunksPresent = false
-    let observational = true
-    var elapsedMs: Double = 0
-    var visitedEntries = 0
-    var entryLimit = 100_000
-    var timeLimitMs: Double = 10_000
-    let depthLimit = 4
-    var months: [Month] = []
-    var incompleteFileCount: Int64 = 0
-    var noncanonicalFileCount: Int64 = 0
-    var noncanonicalBytes: Int64 = 0
-    var noncanonicalDirectoryCount: Int64 = 0
-    var symlinkCount: Int64 = 0
-    var otherEntryCount: Int64 = 0
-    var errors: [String: Int] = [:]
+    public var status = "complete"
+    public var chunksPresent = false
+    public let observational = true
+    public var elapsedMs: Double = 0
+    public var visitedEntries = 0
+    public var entryLimit = 100_000
+    public var timeLimitMs: Double = 10_000
+    public let depthLimit = 4
+    public var months: [Month] = []
+    public var incompleteFileCount: Int64 = 0
+    public var noncanonicalFileCount: Int64 = 0
+    public var noncanonicalBytes: Int64 = 0
+    public var noncanonicalDirectoryCount: Int64 = 0
+    public var symlinkCount: Int64 = 0
+    public var otherEntryCount: Int64 = 0
+    public var errors: [String: Int] = [:]
 
-    static func scan(root: URL, maxEntries: Int = 100_000, maxSeconds: Double = 10) async throws -> ChunkInventory {
+    public static func scan(root: URL, maxEntries: Int = 100_000, maxSeconds: Double = 10) async throws -> ChunkInventory {
         await Task.detached { scanSynchronously(root: root, maxEntries: maxEntries, maxSeconds: maxSeconds) }.value
     }
 
-    static func scanSynchronously(root: URL, maxEntries: Int = 100_000, maxSeconds: Double = 10,
+    public static func scanSynchronously(root: URL, maxEntries: Int = 100_000, maxSeconds: Double = 10,
                                   onCanonicalFile: ((Int32, String, String, stat) throws -> Void)? = nil) -> ChunkInventory {
         let started = ProcessInfo.processInfo.systemUptime
         var result = ChunkInventory()
@@ -133,7 +133,7 @@ struct ChunkInventory: Encodable, Sendable {
         return result
     }
 
-    static func isCanonicalKey(_ key: String) -> Bool {
+    public static func isCanonicalKey(_ key: String) -> Bool {
         let parts = key.components(separatedBy: "/")
         return parts.count == 4 && parts[0] == "chunks" && validDay(month: parts[1], day: parts[2]) && validVideoID(parts[3])
     }

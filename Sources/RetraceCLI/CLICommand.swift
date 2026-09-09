@@ -1,4 +1,5 @@
 import Foundation
+import RetraceKit
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
@@ -15,20 +16,6 @@ struct CLIResult: Sendable {
     let stdout: Data
     let stderr: String
     let exitCode: Int32
-}
-
-struct CLIError: Error, Encodable, Sendable {
-    let code: String
-    let message: String
-    let exitCode: Int32
-    let missingGates: [String]?
-
-    init(_ code: String, _ message: String, exitCode: Int32 = 3, missingGates: [String]? = nil) {
-        self.code = code
-        self.message = message
-        self.exitCode = exitCode
-        self.missingGates = missingGates
-    }
 }
 
 private struct CLIReport: Encodable {
